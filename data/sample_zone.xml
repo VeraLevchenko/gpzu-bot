@@ -1,0 +1,28 @@
+<Zone>
+  <Code>Ж-2</Code>
+  <Title>Зона малоэтажной жилой застройки</Title>
+  <ActRef>Решение ... № ... от ...</ActRef>
+  <Uses>
+    <Main>
+      <Use>Индивидуальные жилые дома</Use>
+      <Use>Блокированные жилые дома</Use>
+    </Main>
+    <Conditional>
+      <Use>Объекты повседневного обслуживания</Use>
+    </Conditional>
+    <Auxiliary>
+      <Use>Гаражи, хозпостройки</Use>
+    </Auxiliary>
+  </Uses>
+  <Params>
+    <SiteSizeMin>300 м²</SiteSizeMin>
+    <Setbacks>
+      <Front>5 м</Front>
+      <Side>3 м</Side>
+      <Rear>3 м</Rear>
+    </Setbacks>
+    <MaxStoreys>3</MaxStoreys>
+    <MaxHeightM>12</MaxHeightM>
+    <MaxCoveragePercent>40%</MaxCoveragePercent>
+  </Params>
+</Zone>
