@@ -74,11 +74,13 @@ class States(StatesGroup):
 router = Router()
 
 # ----------------------- FSM сериализация простых типов ---------------------- #
-def _coords_to_list(coords: List[Coord]) -> List[Dict[str, Any]]:
+from parsers.egrn_parser import Coord as ECoord  # алиас на случай конфликта имён
+
+def _coords_to_list(coords: List[ECoord]) -> List[Dict[str, Any]]:
     return [{"num": c.num, "x": c.x, "y": c.y} for c in coords or []]
 
-def _coords_from_list(items: List[Dict[str, Any]]) -> List[Coord]:
-    return [Coord(num=i.get("num"), x=i.get("x", ""), y=i.get("y", "")) for i in (items or [])]
+def _coords_from_list(items: List[Dict[str, Any]]) -> List[ECoord]:
+    return [ECoord(num=i.get("num"), x=i.get("x", ""), y=i.get("y", "")) for i in (items or [])]
 
 def _egrn_to_dict(e: EGRNData) -> Dict[str, Any]:
     return {
@@ -139,7 +141,6 @@ def _try_detect_code(detected_zone_name: Optional[str]) -> Optional[str]:
     return None
 
 def _decision_keyboard_two() -> InlineKeyboardBuilder:
-    """Две кнопки: Подготовить ГПЗУ / Выбрать зону вручную."""
     kb = InlineKeyboardBuilder()
     kb.button(text="Подготовить ГПЗУ", callback_data="act_prepare")
     kb.button(text="Выбрать зону вручную", callback_data="act_manual")
@@ -147,23 +148,19 @@ def _decision_keyboard_two() -> InlineKeyboardBuilder:
     return kb
 
 def _manual_only_keyboard() -> InlineKeyboardBuilder:
-    """Только одна кнопка: Выбрать зону вручную."""
     kb = InlineKeyboardBuilder()
     kb.button(text="Выбрать зону вручную", callback_data="act_manual")
     kb.adjust(1)
     return kb
 
 def _start_over_keyboard() -> InlineKeyboardBuilder:
-    """Кнопка: Подготовить новый градплан."""
     kb = InlineKeyboardBuilder()
     kb.button(text="Подготовить новый градплан", callback_data="act_restart")
     kb.adjust(1)
     return kb
 
 def _zones_keyboard() -> InlineKeyboardBuilder:
-    """Кнопки только с короткими кодами зон."""
     kb = InlineKeyboardBuilder()
-    # чтобы список не был слишком длинным в столбик — в 3 колонки
     for code in ZONES.keys():
         kb.button(text=code, callback_data=f"zone:{code}")
     kb.adjust(3)
@@ -180,7 +177,6 @@ async def _generate_and_send_gpzu(m: Message, egrn: EGRNData, zone_code: Optiona
             tmp_path = tmp.name
         await m.answer_document(FSInputFile(tmp_path, filename=fn), caption="ГПЗУ — раздел 1.")
         logger.info("DOCX сформирован и отправлен: %s", fn)
-        # Кнопка «Подготовить новый градплан»
         await m.answer("Готово.", reply_markup=_start_over_keyboard().as_markup())
     except Exception as ex:
         logger.exception("Ошибка генерации/отправки DOCX: %s", ex)
@@ -198,7 +194,7 @@ async def start(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(States.WAIT_EGRN)
     await m.answer(
-        "Шаг 1: пришлите XML выписки ЕГРН по земельному участку (файлом).\n"
+        "Шаг 1: пришлите XML/ZIP выписки ЕГРН по земельному участку (файлом).\n"
         "Шаг 2: затем пришлите XML КПТ для квартала — определю территориальную зону."
     )
 
@@ -207,28 +203,27 @@ async def cb_restart(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
     await state.set_state(States.WAIT_EGRN)
-    await call.message.answer(
-        "Начнём заново.\nШаг 1: пришлите XML выписки ЕГРН по земельному участку (файлом)."
-    )
+    await call.message.answer("Начнём заново.\nШаг 1: пришлите XML/ZIP выписки ЕГРН по земельному участку (файлом).")
 
 @router.message(States.WAIT_EGRN, F.document)
 async def got_egrn(m: Message, state: FSMContext):
     doc: TgDocument = m.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".xml"):
-        await m.answer("Это не XML. Пришлите XML файл ЕГРН.", reply_markup=_start_over_keyboard().as_markup())
+    if not doc.file_name or not (doc.file_name.lower().endswith(".xml") or doc.file_name.lower().endswith(".zip")):
+        await m.answer("Это не XML/ZIP. Пришлите файл выписки ЕГРН.", reply_markup=_start_over_keyboard().as_markup())
         return
 
     try:
         file = await m.bot.get_file(doc.file_id)
-        xml_bytes = await _download_with_retries(m.bot, file.file_path)
-        logger.info("Получен XML ЕГРН: %s (%d байт)", doc.file_name, len(xml_bytes))
+        egrn_bytes = await _download_with_retries(m.bot, file.file_path)
+        logger.info("Получен файл ЕГРН: %s (%d байт)", doc.file_name, len(egrn_bytes))
     except Exception as ex:
-        logger.exception("Ошибка скачивания XML ЕГРН: %s", ex)
-        await m.answer(f"Не удалось скачать XML: {ex}", reply_markup=_start_over_keyboard().as_markup())
+        logger.exception("Ошибка скачивания ЕГРН: %s", ex)
+        await m.answer(f"Не удалось скачать файл: {ex}", reply_markup=_start_over_keyboard().as_markup())
         return
 
+    # Парсинг (поддерживает XML и ZIP с XML внутри)
     try:
-        egrn: EGRNData = parse_egrn_xml(xml_bytes)
+        egrn: EGRNData = parse_egrn_xml(egrn_bytes)
         sample = ", ".join([f"{c.num}({c.x};{c.y})" for c in (egrn.coordinates or [])[:5]])
         logger.info(
             "Распарсили ЕГРН: cadnum=%s, area=%s, is_land=%s, coords=%s; sample: %s; capital=%s",
@@ -236,20 +231,29 @@ async def got_egrn(m: Message, state: FSMContext):
             sample, (egrn.capital_objects or [])
         )
     except Exception as ex:
-        logger.exception("Ошибка парсинга XML ЕГРН: %s", ex)
-        await m.answer(f"Ошибка парсинга: {ex}", reply_markup=_start_over_keyboard().as_markup())
+        logger.exception("Ошибка парсинга ЕГРН: %s", ex)
+        await m.answer(f"Ошибка парсинга выписки: {ex}", reply_markup=_start_over_keyboard().as_markup())
         return
 
+    # Проверки корректности выписки
     if not egrn.is_land:
         await m.answer("Это не выписка ЕГРН по земельному участку.", reply_markup=_start_over_keyboard().as_markup())
+        return
+    if not egrn.cadnum:
+        await m.answer("Не удалось определить кадастровый номер в выписке.", reply_markup=_start_over_keyboard().as_markup())
         return
     if not egrn.has_coords:
         await m.answer("В выписке нет координат границ участка.", reply_markup=_start_over_keyboard().as_markup())
         return
 
+    # Сохраняем ЕГРН и просим КПТ + показываем КН
     await state.update_data(egrn=_egrn_to_dict(egrn))
     await state.set_state(States.WAIT_KPT)
-    await m.answer("Шаг 2: пришлите XML КПТ (карта-план территории).")
+    await m.answer(
+        f"Выписка корректна.\nКадастровый номер: *{egrn.cadnum}*\n\n"
+        f"Шаг 2: пришлите XML КПТ (карта-план территории).",
+        parse_mode="Markdown"
+    )
 
 @router.message(States.WAIT_KPT, F.document)
 async def got_kpt(m: Message, state: FSMContext):
@@ -281,6 +285,7 @@ async def got_kpt(m: Message, state: FSMContext):
         await m.answer(f"Ошибка парсинга КПТ: {ex}", reply_markup=_start_over_keyboard().as_markup())
         return
 
+    # Контур ЗУ
     parcel_coords: List[Tuple[float, float]] = []
     for c in egrn.coordinates or []:
         try:
@@ -289,6 +294,7 @@ async def got_kpt(m: Message, state: FSMContext):
         except Exception:
             continue
 
+    # Определение зоны
     detected_code: Optional[str] = None
     if zones_raw and parcel_coords:
         try:
