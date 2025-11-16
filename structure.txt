@@ -1,0 +1,149 @@
+.
+├── bot.py
+├── data
+│   └── sample_zone.xml
+├── generator
+│   ├── docx_builder.py
+│   └── __pycache__
+│       └── docx_builder.cpython-312.pyc
+├── parsers
+│   ├── egrn_parser.py
+│   ├── kpt_parser.py
+│   ├── __pycache__
+│   │   ├── egrn_parser.cpython-312.pyc
+│   │   └── kpt_parser.cpython-312.pyc
+│   ├── T_parser.py
+│   └── zone_parser.py
+├── requirements.txt
+├── structure.txt
+├── templates
+│   ├── gpzu_template.docx
+│   ├── tz_reglament
+│   │   ├── Ж-1_vri.docx
+│   │   ├── Ж-2_vri.docx
+│   │   ├── Ж-Р_vri.docx
+│   │   ├── ЗН-1_vri.docx
+│   │   ├── ЗН-2_vri.docx
+│   │   ├── ЗН-3_vri.docx
+│   │   ├── ЗН-4_vri.docx
+│   │   ├── И_vri.docx
+│   │   ├── ОД-1_vri.docx
+│   │   ├── ОД-2.docx
+│   │   ├── ОД-2_vri.docx
+│   │   ├── ОД-3_vri.docx
+│   │   ├── ОД-4_vri.docx
+│   │   ├── ОД-5_vri.docx
+│   │   ├── ОЖ_vri.docx
+│   │   ├── П-1_vri.docx
+│   │   ├── П-2_vri.docx
+│   │   ├── Р-1_vri.docx
+│   │   ├── Р-2_vri.docx
+│   │   ├── РТ_vri.docx
+│   │   ├── СН-1_vri.docx
+│   │   ├── СН-2_vri.docx
+│   │   ├── СХ-1_vri.docx
+│   │   ├── СХ-2_vri.docx
+│   │   ├── Т-1_vri.docx
+│   │   ├── Т-2_vri.docx
+│   │   ├── Т-3_vri.docx
+│   │   └── Т-4_vri.docx
+│   └── Пример Дозовская, земельный участок №55Б.docx:Zone.Identifier
+├── utils
+│   ├── __pycache__
+│   │   └── spatial.cpython-312.pyc
+│   └── spatial.py
+└── venv
+    ├── bin
+    │   ├── activate
+    │   ├── activate.csh
+    │   ├── activate.fish
+    │   ├── Activate.ps1
+    │   ├── docxcompose
+    │   ├── dotenv
+    │   ├── f2py
+    │   ├── numpy-config
+    │   ├── pip
+    │   ├── pip3
+    │   ├── pip3.12
+    │   ├── pybabel
+    │   ├── python -> python3
+    │   ├── python3 -> /usr/bin/python3
+    │   └── python3.12 -> python3
+    ├── include
+    │   └── python3.12
+    ├── lib
+    │   └── python3.12
+    │       └── site-packages
+    │           ├── aiofiles
+    │           ├── aiofiles-24.1.0.dist-info
+    │           ├── aiogram
+    │           ├── aiogram-3.13.1.dist-info
+    │           ├── aiohappyeyeballs
+    │           ├── aiohappyeyeballs-2.6.1.dist-info
+    │           ├── aiohttp
+    │           ├── aiohttp-3.10.11.dist-info
+    │           ├── aiosignal
+    │           ├── aiosignal-1.4.0.dist-info
+    │           ├── annotated_types
+    │           ├── annotated_types-0.7.0.dist-info
+    │           ├── attr
+    │           ├── attrs
+    │           ├── attrs-25.4.0.dist-info
+    │           ├── babel
+    │           ├── babel-2.17.0.dist-info
+    │           ├── certifi
+    │           ├── certifi-2025.11.12.dist-info
+    │           ├── _distutils_hack
+    │           ├── distutils-precedence.pth
+    │           ├── docx
+    │           ├── docxcompose
+    │           ├── docxcompose-1.4.0.dist-info
+    │           ├── docxtpl
+    │           ├── docxtpl-0.16.7.dist-info
+    │           ├── dotenv
+    │           ├── frozenlist
+    │           ├── frozenlist-1.8.0.dist-info
+    │           ├── idna
+    │           ├── idna-3.11.dist-info
+    │           ├── jinja2
+    │           ├── jinja2-3.1.6.dist-info
+    │           ├── lxml
+    │           ├── lxml-5.3.0.dist-info
+    │           ├── magic_filter
+    │           ├── magic_filter-1.0.12.dist-info
+    │           ├── markupsafe
+    │           ├── markupsafe-3.0.3.dist-info
+    │           ├── multidict
+    │           ├── multidict-6.7.0.dist-info
+    │           ├── numpy
+    │           ├── numpy-2.3.4.dist-info
+    │           ├── numpy.libs
+    │           ├── pip
+    │           ├── pip-24.0.dist-info
+    │           ├── pkg_resources
+    │           ├── propcache
+    │           ├── propcache-0.4.1.dist-info
+    │           ├── __pycache__
+    │           ├── pydantic
+    │           ├── pydantic-2.9.2.dist-info
+    │           ├── pydantic_core
+    │           ├── pydantic_core-2.23.4.dist-info
+    │           ├── python_docx-1.1.2.dist-info
+    │           ├── python_dotenv-1.0.1.dist-info
+    │           ├── setuptools
+    │           ├── setuptools-80.9.0.dist-info
+    │           ├── shapely
+    │           ├── shapely-2.0.4.dist-info
+    │           ├── shapely.libs
+    │           ├── six-1.17.0.dist-info
+    │           ├── six.py
+    │           ├── typing_extensions-4.15.0.dist-info
+    │           ├── typing_extensions.py
+    │           ├── typing_inspection
+    │           ├── typing_inspection-0.4.2.dist-info
+    │           ├── yarl
+    │           └── yarl-1.22.0.dist-info
+    ├── lib64 -> lib
+    └── pyvenv.cfg
+
+84 directories, 63 files
