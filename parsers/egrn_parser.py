@@ -1,23 +1,55 @@
 # parsers/egrn_parser.py
+"""
+Парсер выписок ЕГРН по земельным участкам.
+
+Поддерживает:
+- входные данные в виде raw XML (bytes)
+- ZIP-архив с XML или XML.GZ внутри
+
+Возвращает объект EGRNData с основными атрибутами:
+- cadnum          — кадастровый номер
+- address         — адрес (readable_address)
+- area            — площадь (строкой, как в XML)
+- permitted_use   — вид разрешённого использования по документу (ВРИ)
+- is_land         — признак, что объект — земельный участок
+- coordinates     — список точек контура
+- capital_objects — включённые объекты (кадастровые номера)
+- region, municipality, settlement — административное деление
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from io import BytesIO
-from typing import List, Optional, Tuple, Iterable
-import re
-import zipfile
+from typing import List, Optional, Iterable, Tuple
+
+import io
 import gzip
+import zipfile
+import os
 
 from lxml import etree
 
 
+# ------------------------------ МОДЕЛИ ------------------------------ #
+
+
 @dataclass
 class Coord:
-    num: str
-    x: str
-    y: str
+    """
+    Одна точка контура земельного участка.
+    num  – номер точки (ord_nmb)
+    x, y – координаты (строкой, как в XML)
+    """
+    num: Optional[str] = None
+    x: Optional[str] = None
+    y: Optional[str] = None
 
 
 @dataclass
 class EGRNData:
+    """
+    Сводная информация из выписки ЕГРН по земельному участку.
+    """
     cadnum: Optional[str] = None
     address: Optional[str] = None
     area: Optional[str] = None  # строкой, как в исходном XML
@@ -28,274 +60,265 @@ class EGRNData:
     is_land: bool = False
     has_coords: bool = False
     capital_objects: Optional[List[str]] = None
+    permitted_use: Optional[str] = None  # ВРИ по документу
 
 
-# ------------------------------- helpers ------------------------------- #
-
-def _is_zip(data: bytes) -> bool:
-    try:
-        return zipfile.is_zipfile(BytesIO(data))
-    except Exception:
-        return False
-
-
-def _sanitize_xml_bytes(raw: bytes) -> bytes:
-    """
-    Отрезаем всё до первого символа '<' (на случай BOM/мусора).
-    """
-    i = raw.find(b"<")
-    if i == -1:
-        raise ValueError("В файле отсутствует символ начала XML ('<'). Это не XML-выписка.")
-    return raw[i:]
-
-
-_PRIOR_NAME_RE = re.compile(r"(land|parcel|record|выпис|egrn)", re.I)
-
-
-def _read_zip_member(zf: zipfile.ZipFile, name: str) -> bytes:
-    data = zf.read(name)
-    if name.lower().endswith(".xml.gz"):
-        try:
-            data = gzip.decompress(data)
-        except Exception as ex:
-            raise ValueError(f"Не удалось распаковать {name}: {ex}")
-    return _sanitize_xml_bytes(data)
-
-
-def _pick_xml_from_zip(zf: zipfile.ZipFile) -> bytes:
-    all_names = [n for n in zf.namelist() if not n.endswith("/")]
-    xml_like = [n for n in all_names if n.lower().endswith((".xml", ".xml.gz"))]
-    if not xml_like:
-        raise ValueError("В ZIP-архиве не найдено ни одного файла .xml или .xml.gz.")
-
-    priority = [n for n in xml_like if _PRIOR_NAME_RE.search(n)]
-    candidates = priority or sorted(xml_like, key=lambda n: zf.getinfo(n).file_size, reverse=True)
-
-    last_err: Optional[Exception] = None
-    for name in candidates:
-        try:
-            data = _read_zip_member(zf, name)
-            etree.fromstring(data)  # простая проверка валидности
-            return data
-        except Exception as ex:
-            last_err = ex
-            continue
-
-    raise ValueError(f"Не удалось извлечь пригодный XML из ZIP. Последняя ошибка: {last_err}")
+# ------------------------- ВСПОМОГАТЕЛЬНЫЕ ------------------------- #
 
 
 def _ensure_xml_bytes(input_bytes: bytes) -> bytes:
-    if _is_zip(input_bytes):
-        with zipfile.ZipFile(BytesIO(input_bytes)) as zf:
-            return _pick_xml_from_zip(zf)
-    return _sanitize_xml_bytes(input_bytes)
+    """
+    Принимает сырые байты:
+      - если это ZIP (PK...), достаём из него XML или XML.GZ
+        *Игнорируем* файлы, имя которых начинается с proto_ (proto_.xml и т.п.)
+      - иначе считаем, что это уже XML.
+    """
+    if input_bytes[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(input_bytes)) as zf:
+            xml_candidates: List[str] = []
+            gz_candidates: List[str] = []
+            proto_xml: List[str] = []
+            proto_gz: List[str] = []
+
+            for info in zf.infolist():
+                name_lower = info.filename.lower()
+                base = os.path.basename(name_lower)
+
+                if name_lower.endswith(".xml"):
+                    if base.startswith("proto_"):
+                        proto_xml.append(info.filename)
+                    else:
+                        xml_candidates.append(info.filename)
+                elif name_lower.endswith(".gz"):
+                    if base.startswith("proto_"):
+                        proto_gz.append(info.filename)
+                    else:
+                        gz_candidates.append(info.filename)
+
+            # Сначала обычные XML, кроме proto_
+            if xml_candidates:
+                return zf.read(xml_candidates[0])
+
+            # Потом gzip-XML, кроме proto_
+            if gz_candidates:
+                gz_data = zf.read(gz_candidates[0])
+                return gzip.decompress(gz_data)
+
+            # В крайнем случае — proto_.xml (если ничего больше нет)
+            if proto_xml:
+                return zf.read(proto_xml[0])
+
+            if proto_gz:
+                gz_data = zf.read(proto_gz[0])
+                return gzip.decompress(gz_data)
+
+            raise ValueError("В ZIP-архиве не найден XML или XML.GZ")
+
+    # Не ZIP — считаем сразу XML
+    return input_bytes
 
 
 def _root(xml_bytes: bytes) -> etree._Element:
-    try:
-        return etree.fromstring(xml_bytes)
-    except Exception as ex:
-        raise ValueError(f"Некорректный XML: {ex}")
-
-
-def _text(node: Optional[etree._Element]) -> str:
-    if node is None:
-        return ""
-    return "".join(node.itertext()).strip()
-
-
-def _first_text(root: etree._Element, xpaths: Iterable[str]) -> Optional[str]:
-    for xp in xpaths:
-        el = root.xpath(xp)
-        if el:
-            if isinstance(el[0], etree._Element):
-                val = _text(el[0])
-            else:
-                val = str(el[0]).strip()
-            if val:
-                return val
-    return None
+    """
+    Разбираем XML в корневой элемент.
+    """
+    parser = etree.XMLParser(remove_blank_text=True, recover=True)
+    return etree.fromstring(xml_bytes, parser=parser)
 
 
 def _collect_texts(root: etree._Element, xpaths: Iterable[str]) -> List[str]:
-    out: List[str] = []
+    """
+    Пробегаем по списку XPath-выражений и собираем текст.
+    Используем только root.xpath(...), НЕ .find() — чтобы не вызывать
+    lxml._elementpath и не ловить invalid predicate.
+    """
+    result: List[str] = []
     for xp in xpaths:
-        for el in root.xpath(xp):
-            if isinstance(el, etree._Element):
-                val = _text(el)
+        nodes = root.xpath(xp)
+        for node in nodes:
+            if isinstance(node, (etree._ElementUnicodeResult, str)):
+                text = str(node).strip()
             else:
-                val = str(el).strip()
-            if val:
-                out.append(val)
-    return out
+                text = (node.text or "").strip()
+            if text:
+                result.append(text)
+    return result
 
 
-# ---------------------------- field extractors ---------------------------- #
+# ----------------------- ВЫТЯГИВАНИЕ ПОЛЕЙ ----------------------- #
 
-_CADNUM_PAT = re.compile(r"\d{2}:\d{2}:\d{6,}:\d+")
 
 def _extract_cadnum(root: etree._Element) -> Optional[str]:
-    return _first_text(root, [
-        "//*[local-name()='cad_number']/text()",
-        "//*[local-name()='cadnum']/text()",
-        "//*[local-name()='cadastreNumber']/text()",
-        "//*[local-name()='CadastralNumber']/text()",
-        "//*[local-name()='object']/@cadastralNumber",
-    ])
+    """
+    Кадастровый номер земельного участка.
+
+    Для большинства выписок extract_base_params_land первый cad_number —
+    это именно КН участка.
+    """
+    texts = _collect_texts(root, ["//*[local-name()='cad_number']/text()"])
+    return texts[0] if texts else None
 
 
 def _extract_address(root: etree._Element) -> Optional[str]:
-    return _first_text(root, [
-        "//*[local-name()='readable_address']/text()",
-        "//*[local-name()='address']/text()",
-        "//*[local-name()='Address']/text()",
-        "//*[local-name()='location']/text()",
-    ])
+    """
+    Адрес / местоположение участка.
+    """
+    texts = _collect_texts(root, ["//*[local-name()='readable_address']/text()"])
+    return texts[0] if texts else None
 
 
 def _extract_area(root: etree._Element) -> Optional[str]:
-    # В твоём примере: /land_record/params/area/value
-    texts = _collect_texts(root, [
-        "//*[local-name()='params']/*[local-name()='area']/*[local-name()='value']/text()",
-        "//*[local-name()='area']/*[local-name()='value']/text()",
-        "//*[local-name()='area_value']/text()",
-        "//*[local-name()='AreaValue']/text()",
-        "//*[local-name()='area']/text()",   # общий запасной вариант
-        "//*[local-name()='Area']/text()",
-    ])
-    for t in texts:
-        s = re.sub(r"[^\d,\.]", "", t).replace(",", ".")
-        if s:
-            return re.sub(r"\.0+$", "", s)
-    return None
+    """
+    Площадь участка.
+
+    Сначала пробуем params/area/value (уточнённая площадь),
+    при её отсутствии берём просто первый area/value.
+    """
+    texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='params']/*[local-name()='area']/*[local-name()='value']/text()",
+            "//*[local-name()='area']/*[local-name()='value']/text()",
+        ],
+    )
+    if not texts:
+        return None
+    return texts[0].replace(",", ".").strip()
+
+
+def _extract_permitted_use(root: etree._Element) -> Optional[str]:
+    """
+    ВРИ (вид разрешенного использования) по документу.
+
+    Частый вариант:
+      land_record/params/permitted_use/permitted_use_established/by_document
+    """
+    texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='permitted_use']//*[local-name()='by_document']/text()",
+            "//*[local-name()='permitted_use_established']//*[local-name()='by_document']/text()",
+        ],
+    )
+    return texts[0] if texts else None
 
 
 def _extract_is_land(root: etree._Element) -> bool:
-    # корневой элемент extract_about_property_land или наличие land_record
-    if root.tag.lower().endswith("extract_about_property_land"):
+    """
+    Пытаемся понять, что объект – именно земельный участок.
+    """
+    # Для extract_base_params_land — точно ЗУ
+    if root.tag.endswith("extract_base_params_land"):
         return True
-    nodes = root.xpath("//*[local-name()='land_record' or local-name()='parcel' or local-name()='LandRecord']")
-    return bool(nodes)
 
+    # Запасной вариант — наличие land_record
+    if root.xpath("//*[local-name()='land_record']"):
+        return True
 
-def _extract_capital_objects(root: etree._Element, own_cad: Optional[str]) -> List[str]:
-    """
-    Берём только included_objects (объекты в границах ЗУ),
-    исключая сам кадастровый номер участка.
-    """
-    objs = _collect_texts(root, [
-        "//*[local-name()='cad_links']/*[local-name()='included_objects']/*[local-name()='included_object']/*[local-name()='cad_number']/text()"
-    ])
-    out: List[str] = []
-    seen = set()
-    for cad in objs:
-        cad = cad.strip()
-        if not cad or not _CADNUM_PAT.fullmatch(cad):
-            continue
-        if own_cad and cad == own_cad:
-            continue
-        if cad in seen:
-            continue
-        seen.add(cad)
-        out.append(cad)
-    return out
-
-
-def _coords_from_ordinates(nodes: List[etree._Element]) -> List[Coord]:
-    coords: List[Coord] = []
-    for o in nodes:
-        # дочерние элементы x/y/ord_nmb (регистр может быть любой)
-        x = _first_text(o, ["./*[translate(local-name(),'XY','xy')='x']/text()"])
-        y = _first_text(o, ["./*[translate(local-name(),'XY','xy')='y']/text()"])
-        num = _first_text(o, ["./*[translate(local-name(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='ord_nmb']/text()"])
-        # на всякий случай — попробуем атрибуты, если есть
-        if not x:
-            x = (o.get("X") or o.get("x") or "").strip()
-        if not y:
-            y = (o.get("Y") or o.get("y") or "").strip()
-        if not num:
-            num = (o.get("Num") or o.get("num") or "").strip()
-        if x or y or num:
-            coords.append(Coord(num=num or "", x=(x or ""), y=(y or "")))
-    return coords
+    return False
 
 
 def _extract_coords(root: etree._Element) -> List[Coord]:
     """
-    Приоритет: основной контур из contours_location (границы ЗУ),
-    затем — контуры из object_parts (если вдруг основных нет).
-    Никакого переупорядочивания — оставляем как в XML.
+    Координаты контура участка.
+
+    Типичный формат:
+      .../ordinates/ordinate/x, y, ord_nmb
     """
-    # 1) Основные границы участка:
-    ords_main = root.xpath(
-        "//*[local-name()='contours_location']"
-        "/*[local-name()='contours']"
-        "/*[local-name()='contour']"
-        "/*[local-name()='entity_spatial']"
-        "/*[local-name()='spatials_elements']"
-        "/*[local-name()='spatial_element']"
-        "/*[local-name()='ordinates']"
-        "/*[local-name()='ordinate']"
-    )
-    coords = _coords_from_ordinates(ords_main)
+    coords: List[Coord] = []
 
-    # 2) Если нет — попробуем по object_parts (части объекта/контуры):
-    if not coords:
-        ords_parts = root.xpath(
-            "//*[local-name()='object_parts']"
-            "/*[local-name()='object_part']"
-            "/*[local-name()='contours']"
-            "/*[local-name()='contour']"
-            "/*[local-name()='entity_spatial']"
-            "/*[local-name()='spatials_elements']"
-            "/*[local-name()='spatial_element']"
-            "/*[local-name()='ordinates']"
-            "/*[local-name()='ordinate']"
-        )
-        coords = _coords_from_ordinates(ords_parts)
+    for el in root.xpath("//*[local-name()='ordinate']"):
+        x_list = el.xpath("./*[local-name()='x']/text()")
+        y_list = el.xpath("./*[local-name()='y']/text()")
+        num_list = el.xpath("./*[local-name()='ord_nmb']/text()")
 
-    # 3) В последнюю очередь — старые варианты ЕГРН (Ordinate/X/Y/Num как атрибуты):
-    if not coords:
-        ords_old = root.xpath(
-            "//*[local-name()='EntitySpatial']"
-            "//*[local-name()='SpelementUnit']"
-            "//*[local-name()='Ordinate']"
-        )
-        for o in ords_old:
-            num = (o.get("Num") or o.get("num") or "").strip()
-            x = (o.get("X") or o.get("x") or "").strip()
-            y = (o.get("Y") or o.get("y") or "").strip()
-            if x or y or num:
-                coords.append(Coord(num=num, x=x, y=y))
+        x = x_list[0].strip() if x_list else None
+        y = y_list[0].strip() if y_list else None
+        num = num_list[0].strip() if num_list else None
+
+        if x or y:
+            coords.append(Coord(num=num, x=x, y=y))
 
     return coords
 
 
-def _extract_admins(root: etree._Element) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    region = _first_text(root, [
-        "//*[local-name()='region']/text()",
-        "//*[local-name()='Region']/text()",
-        "//*[local-name()='subject']/text()",
-    ])
-    municipality = _first_text(root, [
-        "//*[local-name()='municipality']/text()",
-        "//*[local-name()='Municipality']/text()",
-    ])
-    settlement = _first_text(root, [
-        "//*[local-name()='settlement']/text()",
-        "//*[local-name()='Settlement']/text()",
-        "//*[local-name()='locality']/text()",
-    ])
+def _extract_capital_objects(root: etree._Element, main_cadnum: Optional[str]) -> List[str]:
+    """
+    Включённые объекты (кадастровые номера), если есть.
+
+    Пример:
+      land_record/cad_links/included_objects/included_object/cad_number
+    """
+    res: List[str] = []
+
+    texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='included_objects']//*[local-name()='cad_number']/text()",
+        ],
+    )
+    for t in texts:
+        s = t.strip()
+        if s and s != (main_cadnum or ""):
+            res.append(s)
+
+    return res
+
+
+def _extract_admins(
+    root: etree._Element,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Регион, муниципальное образование, населённый пункт.
+    """
+    region = None
+    municipality = None
+    settlement = None
+
+    region_texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='region']/*[local-name()='value']/text()",
+            "//*[local-name()='region']/text()",
+        ],
+    )
+    if region_texts:
+        region = region_texts[0]
+
+    mun_texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='municipality']/*[local-name()='value']/text()",
+            "//*[local-name()='municipality']/text()",
+        ],
+    )
+    if mun_texts:
+        municipality = mun_texts[0]
+
+    sett_texts = _collect_texts(
+        root,
+        [
+            "//*[local-name()='city']/*[local-name()='name_city']/text()",
+            "//*[local-name()='city']/text()",
+            "//*[local-name()='locality']/text()",
+        ],
+    )
+    if sett_texts:
+        settlement = sett_texts[0]
+
     return region, municipality, settlement
 
 
-# ------------------------------- public api ------------------------------- #
+# --------------------------- ОСНОВНАЯ ФУНКЦИЯ --------------------------- #
+
 
 def parse_egrn_xml(input_bytes: bytes) -> EGRNData:
     """
     Универсальный вход:
       - raw XML (bytes)
       - ZIP с XML/XML.GZ внутри
+
+    На выходе — EGRNData.
     """
     xml_bytes = _ensure_xml_bytes(input_bytes)
     root = _root(xml_bytes)
@@ -308,6 +331,7 @@ def parse_egrn_xml(input_bytes: bytes) -> EGRNData:
     has_coords = bool(coords)
     capital_objects = _extract_capital_objects(root, cadnum)
     region, municipality, settlement = _extract_admins(root)
+    permitted_use = _extract_permitted_use(root)
 
     return EGRNData(
         cadnum=cadnum,
@@ -320,4 +344,5 @@ def parse_egrn_xml(input_bytes: bytes) -> EGRNData:
         is_land=is_land,
         has_coords=has_coords,
         capital_objects=capital_objects,
+        permitted_use=permitted_use,
     )
