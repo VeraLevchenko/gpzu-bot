@@ -33,3 +33,13 @@ try:
     KAITEN_COLUMN_ID = int(os.getenv("KAITEN_COLUMN_ID", "4952339"))
 except ValueError:
     KAITEN_COLUMN_ID = 4952339
+
+# Внутренние ключи полей Kaiten
+KAITEN_FIELD_CADNUM = "id_238069"          # Исх_данные 1 Кадастровый номер
+KAITEN_FIELD_SUBMIT_METHOD = "id_270924"   # Способ подачи
+
+# Значение справочника для "Способ подачи" = ЕПГУ
+KAITEN_SUBMIT_METHOD_EPGU = 93413
+
+# Новое поле: "входящая дата" (дата заявления)
+KAITEN_FIELD_INCOMING_DATE = "id_228500"

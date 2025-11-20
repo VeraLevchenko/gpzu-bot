@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, date
+from datetime import datetime
 from typing import Optional, Dict, Any
 
 from aiogram import Router, F
@@ -17,13 +17,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.utils import download_with_retries
 from parsers.application_parser import ApplicationData, parse_application_docx
-
-# --- ИМПОРТЫ KAITEN ---
-# KAITEN_BOARD_ID остается в импорте, так как нужен для создания карточки
-from core.config import KAITEN_DOMAIN, KAITEN_SPACE_ID, KAITEN_BOARD_ID
-# Предполагаем, что utils/kaiten_service.py доступен как utils.kaiten_service
+from core.config import (
+    KAITEN_DOMAIN,
+    KAITEN_SPACE_ID,
+    KAITEN_BOARD_ID,
+    KAITEN_FIELD_CADNUM,
+    KAITEN_FIELD_SUBMIT_METHOD,
+    KAITEN_SUBMIT_METHOD_EPGU,
+    KAITEN_FIELD_INCOMING_DATE,
+)
 from utils.kaiten_service import create_card, upload_attachment
-# ----------------------
 
 logger = logging.getLogger("gpzu-bot.kaiten")
 
@@ -33,20 +36,13 @@ kaiten_router = Router()
 # ----------------------------- СОСТОЯНИЯ ----------------------------- #
 class KaitenStates(StatesGroup):
     WAIT_STATEMENT_DOC = State()   # ждём заявление .docx
-    WAIT_ATTACH_ARCHIVE = State()  # ждём архив с приложениями
     WAIT_CONFIRMATION = State()    # ждём подтверждения отправки в Kaiten
 
 
 # ----------------------------- КЛАВИАТУРЫ ----------------------------- #
-def _skip_archive_keyboard() -> InlineKeyboardBuilder:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Продолжить без приложений", callback_data="kaiten:skip_archive")
-    kb.adjust(1)
-    return kb
-
 def _confirm_creation_keyboard() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Создать задачу в Kaiten", callback_data="kaiten:create_task")
+    kb.button(text="✅ Создать задачу в Кайтен", callback_data="kaiten:create_task")
     kb.button(text="❌ Отмена", callback_data="kaiten:cancel")
     kb.adjust(1)
     return kb
@@ -73,7 +69,7 @@ async def kaiten_entry(m: Message, state: FSMContext):
 async def kaiten_got_statement(m: Message, state: FSMContext):
     """
     Принимаем файл заявления .docx, скачиваем, парсим, сохраняем результат
-    и переходим к шагу с приложениями.
+    и сразу переходим к подтверждению создания задачи (без приложений).
     """
     doc: TgDocument = m.document
 
@@ -101,14 +97,14 @@ async def kaiten_got_statement(m: Message, state: FSMContext):
         await m.answer("Не удалось разобрать текст заявления. Проверьте, что файл является .docx-документом заявления.")
         return
 
-    # Сохраняем данные
+    # Сохраняем данные для дальнейших шагов
     await state.update_data(
         statement_file_id=doc.file_id,
         statement_file_name=doc.file_name,
         app_data={
             "number": app_data.number,
-            "date": app_data.date.isoformat() if app_data.date else None,
-            "date_text": app_data.date_text,
+            "date": app_data.date.isoformat() if app_data.date else None,  # YYYY-MM-DD
+            "date_text": app_data.date_text,  # исходный текст даты
             "applicant": app_data.applicant,
             "cadnum": app_data.cadnum,
             "purpose": app_data.purpose,
@@ -116,14 +112,8 @@ async def kaiten_got_statement(m: Message, state: FSMContext):
         },
     )
 
-    await state.set_state(KaitenStates.WAIT_ATTACH_ARCHIVE)
-
-    await m.answer(
-        "Заявление получено и обработано.\n\n"
-        "Шаг 2. Прикрепите архив с приложениями к заявлению (например, *.zip*).\n"
-        "Если приложений нет, нажмите «Продолжить без приложений».",
-        reply_markup=_skip_archive_keyboard().as_markup(),
-    )
+    # Сразу показываем сводку и просим подтвердить создание задачи
+    await _show_application_summary(m, state)
 
 
 @kaiten_router.message(KaitenStates.WAIT_STATEMENT_DOC)
@@ -133,58 +123,6 @@ async def kaiten_waiting_statement_fallback(m: Message, state: FSMContext):
     """
     await m.answer(
         "Сейчас я жду файл заявления в формате *.docx*.",
-        parse_mode="Markdown",
-    )
-
-
-# ------------------------ ШАГ 2: ПРИЛОЖЕНИЯ (АРХИВ) ------------------------ #
-@kaiten_router.message(KaitenStates.WAIT_ATTACH_ARCHIVE, F.document)
-async def kaiten_got_archive(m: Message, state: FSMContext):
-    """
-    Принимаем архив с приложениями.
-    """
-    doc: TgDocument = m.document
-
-    if not (
-        doc.file_name
-        and doc.file_name.lower().endswith(
-            (".zip", ".rar", ".7z", ".7zip", ".tar", ".gz")
-        )
-    ):
-        await m.answer(
-            "Пожалуйста, прикрепите архив с приложениями "
-            "(например, *.zip*), либо нажмите «Продолжить без приложений».",
-            reply_markup=_skip_archive_keyboard().as_markup(),
-            parse_mode="Markdown",
-        )
-        return
-
-    await state.update_data(
-        archive_file_id=doc.file_id,
-        archive_file_name=doc.file_name,
-    )
-
-    await _show_application_summary(m, state)
-
-
-@kaiten_router.callback_query(KaitenStates.WAIT_ATTACH_ARCHIVE, F.data == "kaiten:skip_archive")
-async def kaiten_skip_archive(call: CallbackQuery, state: FSMContext):
-    """
-    Продолжение без приложений.
-    """
-    await call.answer()
-    await _show_application_summary(call.message, state)
-
-
-@kaiten_router.message(KaitenStates.WAIT_ATTACH_ARCHIVE)
-async def kaiten_waiting_archive_fallback(m: Message, state: FSMContext):
-    """
-    Обработка других сообщений в состоянии WAIT_ATTACH_ARCHIVE.
-    """
-    await m.answer(
-        "Сейчас я жду архив с приложениями (например, *.zip*), "
-        "или нажмите «Продолжить без приложений».",
-        reply_markup=_skip_archive_keyboard().as_markup(),
         parse_mode="Markdown",
     )
 
@@ -213,6 +151,14 @@ async def _show_application_summary(msg: Message, state: FSMContext):
     purpose = app_dict.get("purpose") or "—"
     service_date_txt = _fmt_date(app_dict.get("service_date"))
 
+    # Формируем планируемое название карточки: "<номер> <заявитель>"
+    if app_dict.get("number") and app_dict.get("applicant"):
+        title_preview = f"{app_dict['number']} {applicant}"
+    elif app_dict.get("number"):
+        title_preview = app_dict["number"]
+    else:
+        title_preview = applicant
+
     text = (
         "📊 *Проверьте данные перед созданием задачи:*\n\n"
         f"📄 *Заявление №:* {number}\n"
@@ -221,40 +167,48 @@ async def _show_application_summary(msg: Message, state: FSMContext):
         f"🗺 *Кадастровый номер:* {cadnum}\n"
         f"🗺 *Цель ЗУ:* {purpose}\n"
         f"📅 *Срок (план):* {service_date_txt}\n\n"
-        f"Название задачи в Kaiten будет: *{applicant}*\n"
+        f"Название задачи в Kaiten будет: *{title_preview}*\n"
         "Создать карточку?"
     )
 
     await state.set_state(KaitenStates.WAIT_CONFIRMATION)
-    await msg.answer(text, reply_markup=_confirm_creation_keyboard().as_markup(), parse_mode="Markdown")
+    await msg.answer(
+        text,
+        reply_markup=_confirm_creation_keyboard().as_markup(),
+        parse_mode="Markdown",
+    )
 
 
 # -------------------------- СОЗДАНИЕ ЗАДАЧИ (API) -------------------------- #
 @kaiten_router.callback_query(KaitenStates.WAIT_CONFIRMATION, F.data == "kaiten:create_task")
 async def kaiten_create_task_handler(call: CallbackQuery, state: FSMContext):
     """
-    Создаем карточку (title=заявитель) и загружаем файлы.
+    Создаем карточку в Kaiten и загружаем файл заявления.
     """
-    await call.message.edit_text("⏳ Создаю задачу в Kaiten, загружаю файлы...")
+    await call.message.edit_text("⏳ Создаю задачу в Кайтен, загружаю заявление...")
 
     data = await state.get_data()
     app_dict = data.get("app_data", {})
 
     # 1. Подготовка данных
     applicant = app_dict.get("applicant") or "Неизвестный заявитель"
-    
-    # Title карточки — только заявитель
-    title = applicant
-
-    # Описание карточки
-    number = app_dict.get("number") or "б/н"
+    number = app_dict.get("number")
     cadnum = app_dict.get("cadnum") or "—"
     purpose = app_dict.get("purpose") or "—"
     date_stmt = app_dict.get("date_text") or "—"
-    service_date_iso = app_dict.get("service_date") # YYYY-MM-DD
+    service_date_iso = app_dict.get("service_date")  # YYYY-MM-DD или None
 
+    # Заголовок карточки: "<номер> <заявитель>"
+    if number and applicant:
+        title = f"{number} {applicant}"
+    elif number:
+        title = number
+    else:
+        title = applicant
+
+    # Описание карточки
     description = (
-        f"**Заявление №:** {number}\n"
+        f"**Заявление №:** {number or 'б/н'}\n"
         f"**Заявитель:** {applicant}\n"
         f"**Кадастровый номер:** {cadnum}\n"
         f"**Цель:** {purpose}\n"
@@ -262,22 +216,60 @@ async def kaiten_create_task_handler(call: CallbackQuery, state: FSMContext):
         "created by telegram bot"
     )
 
+    # --- КАСТОМНЫЕ ПОЛЯ KAITEN ---
+    properties: Dict[str, Any] = {}
+
+    # 1. Исх_данные 1 Кадастровый номер = кадастровый номер ЗУ
+    if KAITEN_FIELD_CADNUM and cadnum and cadnum != "—":
+        properties[KAITEN_FIELD_CADNUM] = cadnum
+
+    # 2. Способ подачи = ЕПГУ (поле-справочник, массив с ID варианта)
+    if KAITEN_FIELD_SUBMIT_METHOD and KAITEN_SUBMIT_METHOD_EPGU:
+        properties[KAITEN_FIELD_SUBMIT_METHOD] = [KAITEN_SUBMIT_METHOD_EPGU]
+
+    # 3. Входящая дата = дата заявления (как объект { "date": "YYYY-MM-DD", "time": null, "tzOffset": null })
+    incoming_iso: Optional[str] = None
+    if app_dict.get("date"):
+        # уже isoformat 'YYYY-MM-DD' из app_data.date.isoformat()
+        incoming_iso = app_dict["date"]
+    else:
+        # пробуем распарсить текстовую дату вида "01.11.2025", если iso нет
+        date_text = app_dict.get("date_text")
+        if date_text:
+            for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                try:
+                    d = datetime.strptime(date_text, fmt).date()
+                    incoming_iso = d.isoformat()
+                    break
+                except Exception:
+                    continue
+
+    if KAITEN_FIELD_INCOMING_DATE and incoming_iso:
+        properties[KAITEN_FIELD_INCOMING_DATE] = {
+            "date": incoming_iso,
+            "time": None,
+            "tzOffset": None,
+        }
+    # ------------------------------
+
     # 2. Создание карточки
     card_id = await create_card(
         title=title,
         description=description,
-        due_date=service_date_iso
+        due_date=service_date_iso,
+        properties=properties or None,
     )
 
     if not card_id:
-        await call.message.edit_text("❌ Ошибка: не удалось создать карточку в Kaiten. Проверьте токены и ID.")
+        await call.message.edit_text(
+            "❌ Ошибка: не удалось создать карточку в Kaiten. Проверьте токены и ID."
+        )
         await state.clear()
         return
 
-    # 3. Загрузка файлов
+    # 3. Загрузка файла заявления
     uploaded_info = []
-    
-    # a) Заявление .docx
+
     stmt_fid = data.get("statement_file_id")
     stmt_name = data.get("statement_file_name", "statement.docx")
     if stmt_fid:
@@ -289,34 +281,25 @@ async def kaiten_create_task_handler(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             logger.error(f"Ошибка загрузки заявления: {e}")
 
-    # b) Архив .zip
-    arch_fid = data.get("archive_file_id")
-    arch_name = data.get("archive_file_name", "archive.zip")
-    if arch_fid:
-        try:
-            f_info = await call.bot.get_file(arch_fid)
-            f_bytes = await download_with_retries(call.bot, f_info.file_path)
-            if await upload_attachment(card_id, arch_name, f_bytes):
-                uploaded_info.append("Приложения")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки архива: {e}")
-
-    # 4. Результат
-    # Формируем ссылку в требуемом формате: "https://.../space/{spaceId}/boards/card/{cardId}"
+    # 4. Ссылка на карточку
     card_url = (
         f"https://{KAITEN_DOMAIN}"
         f"/space/{KAITEN_SPACE_ID}"
-        f"/boards/card/{card_id}" # ID доски удален
+        f"/boards/card/{card_id}"
     )
-    
+
     res_text = (
         f"✅ *Задача успешно создана!*\n"
         f"ID: `{card_id}`\n"
         f"Файлы: {', '.join(uploaded_info) if uploaded_info else 'нет'}\n\n"
         f"[Открыть карточку в Kaiten]({card_url})"
     )
-    
-    await call.message.edit_text(res_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+    await call.message.edit_text(
+        res_text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
     await state.clear()
 
 
