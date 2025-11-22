@@ -1,8 +1,28 @@
-aiogram==3.13.1
-lxml==5.3.0
-python-docx==1.1.2
-python-dotenv==1.0.1
+# requirements.txt
+
+# Telegram Bot Framework
+aiogram==3.15.0
+aiohttp>=3.9.0
+
+# Работа с переменными окружения
+python-dotenv==1.0.0
+
+# Парсинг документов
+python-docx==1.1.0
 docxtpl==0.16.7
-shapely==2.0.4
+lxml==5.3.0
 
+# Работа с Excel
+openpyxl==3.1.2
 
+# Файловая блокировка для журнала ТУ
+filelock==3.13.1
+
+# Геопространственные данные (для TAB-файлов)
+geopandas>=0.14.0
+shapely>=2.0.0
+pyproj>=3.6.0
+fiona>=1.9.0
+
+# HTTP-запросы (для Kaiten API)
+requests>=2.31.0
