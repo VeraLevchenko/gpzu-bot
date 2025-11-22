@@ -1,31 +1,26 @@
 # parsers/tab_parser.py
 """
-Парсер TAB-файлов (MapInfo) для чтения пространственных слоёв.
-
-Этот модуль использует GeoPandas для чтения TAB-файлов и извлечения
-геометрии и атрибутивной информации.
+Парсер TAB/MIF файлов MapInfo для пространственных слоёв.
+Содержит функции для чтения и анализа геопространственных данных.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import geopandas as gpd
-from shapely.geometry import Point, Polygon, MultiPolygon, shape
-from shapely.geometry.base import BaseGeometry
-
-from core.layers_config import FieldMapping
+from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely import wkt
+import pandas as pd
 
 logger = logging.getLogger("gpzu-bot.tab_parser")
 
 
-# ======================= БАЗОВЫЕ ФУНКЦИИ ЧТЕНИЯ ======================= #
-
 def read_tab_file(tab_path: Path | str) -> Optional[gpd.GeoDataFrame]:
     """
-    Прочитать TAB-файл и вернуть GeoDataFrame.
+    Читает TAB-файл и возвращает GeoDataFrame.
     
     Args:
         tab_path: Путь к TAB-файлу
@@ -34,76 +29,32 @@ def read_tab_file(tab_path: Path | str) -> Optional[gpd.GeoDataFrame]:
         GeoDataFrame или None при ошибке
     """
     try:
-        tab_path = Path(tab_path)
-        
-        if not tab_path.exists():
-            logger.error(f"TAB-файл не найден: {tab_path}")
-            return None
-        
-        # Читаем через GeoPandas (использует GDAL/OGR для TAB)
         gdf = gpd.read_file(tab_path, driver="MapInfo File")
-        
-        logger.info(
-            f"TAB-файл прочитан: {tab_path.name}, "
-            f"записей: {len(gdf)}, "
-            f"полей: {len(gdf.columns)}"
-        )
-        
+        logger.debug(f"Прочитан TAB-файл: {Path(tab_path).name}, записей: {len(gdf)}")
         return gdf
-        
     except Exception as ex:
-        logger.exception(f"Ошибка чтения TAB-файла {tab_path}: {ex}")
+        logger.error(f"Ошибка чтения TAB-файла {tab_path}: {ex}")
         return None
 
 
-def check_geometry_intersects(
-    parcel_geometry: BaseGeometry,
-    layer_geometry: BaseGeometry
-) -> bool:
+def get_field_value(row: pd.Series, field_names: List[str]) -> Optional[str]:
     """
-    Проверить пересечение геометрий.
+    Получить значение поля из строки, пробуя разные варианты названий.
     
     Args:
-        parcel_geometry: Геометрия участка
-        layer_geometry: Геометрия объекта из слоя
-    
-    Returns:
-        True если пересекаются
-    """
-    try:
-        return parcel_geometry.intersects(layer_geometry)
-    except Exception as ex:
-        logger.warning(f"Ошибка проверки пересечения: {ex}")
-        return False
-
-
-def get_field_value(row, field_variants: List[str]) -> Optional[str]:
-    """
-    Получить значение поля из строки GeoDataFrame по списку возможных названий.
-    
-    Args:
-        row: Строка GeoDataFrame (Series)
-        field_variants: Список возможных названий поля
+        row: Строка DataFrame
+        field_names: Список возможных названий поля
     
     Returns:
         Значение поля или None
     """
-    for variant in field_variants:
-        # Проверяем с учётом и без учёта регистра
-        if variant in row.index:
-            val = row[variant]
-            return str(val).strip() if val is not None else None
-        
-        # Попробуем найти без учёта регистра
-        for col in row.index:
-            if col.upper() == variant.upper():
-                val = row[col]
-                return str(val).strip() if val is not None else None
-    
+    for field in field_names:
+        if field in row.index:
+            val = row[field]
+            if pd.notna(val) and str(val).strip():
+                return str(val).strip()
     return None
 
-
-# ======================= ПАРСИНГ ТЕРРИТОРИАЛЬНЫХ ЗОН ======================= #
 
 def parse_zones_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     """
@@ -113,7 +64,7 @@ def parse_zones_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
         tab_path: Путь к TAB-файлу с зонами
     
     Returns:
-        Список зон: [{"name": "...", "code": "...", "geometry": Polygon}, ...]
+        Список зон с геометрией и атрибутами
     """
     gdf = read_tab_file(tab_path)
     if gdf is None or gdf.empty:
@@ -121,107 +72,123 @@ def parse_zones_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     
     zones = []
     
+    # Возможные названия полей для кода и наименования зоны
+    CODE_FIELDS = ["Индекс_зоны", "CODE", "ZONE_CODE", "Код", "КОД", "Обозначение", "ОБОЗНАЧЕНИЕ"]
+    NAME_FIELDS = ["Код_объекта", "NAME", "ZONE_NAME", "Наименование", "НАИМЕНОВАНИЕ", "Название", "НАЗВАНИЕ"]
+    
     for idx, row in gdf.iterrows():
-        # Название зоны: сначала пробуем Код_объекта, потом Наименование_объекта
-        zone_name = get_field_value(row, ["Код_объекта", "Наименование_объекта", "NAME"])
-        
-        # Код зоны: Индекс_зоны
-        zone_code = get_field_value(row, ["Индекс_зоны", "Код_Индекс_зоны", "CODE"])
-        
-        geometry = row.get('geometry')
-        
-        if geometry and not geometry.is_empty:
-            zones.append({
-                "name": zone_name or "",
-                "code": zone_code or "",
-                "geometry": geometry,
-            })
+        zone = {
+            "code": get_field_value(row, CODE_FIELDS),
+            "name": get_field_value(row, NAME_FIELDS),
+            "geometry": row.get('geometry'),
+        }
+        zones.append(zone)
     
     logger.info(f"Загружено зон из {Path(tab_path).name}: {len(zones)}")
     return zones
 
 
-def find_zone_for_parcel(
-    parcel_coords: List[Tuple[float, float]],
-    zones: List[Dict[str, Any]]
-) -> Optional[Dict[str, str]]:
+def find_zone_for_parcel(coords: List[Tuple[float, float]], zones: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    Определить, в какой зоне находится участок.
+    Определить территориальную зону для участка по координатам.
     
-    Алгоритм:
-    1. Проверяем, содержит ли какая-либо зона центроид участка → возвращаем эту зону
-    2. Если нет, ищем зону с максимальной площадью пересечения
+    Логика:
+    1. Находим ВСЕ зоны, которые пересекаются с участком
+    2. Вычисляем процент перекрытия для каждой зоны
+    3. Выбираем зону с МАКСИМАЛЬНЫМ перекрытием
+    4. Возвращаем выбранную зону + информацию о всех пересечениях
     
     Args:
-        parcel_coords: Координаты участка [(x, y), ...]
-        zones: Список зон из parse_zones_layer()
+        coords: Координаты участка в формате [(y, x), ...]
+        zones: Список зон с геометрией
     
     Returns:
-        {"name": "...", "code": "..."} или None
+        Словарь с информацией о зоне:
+        {
+            "code": код зоны,
+            "name": название зоны,
+            "multiple_zones": True/False,
+            "all_zones": список всех пересечений,
+            "overlap_percent": процент перекрытия
+        }
     """
-    if not parcel_coords or not zones:
+    if not coords or len(coords) < 3:
+        logger.warning("Недостаточно координат для построения полигона")
         return None
     
     try:
-        # Создаём полигон участка
-        parcel_poly = Polygon(parcel_coords)
-        if not parcel_poly.is_valid:
-            parcel_poly = parcel_poly.buffer(0)
+        parcel_polygon = Polygon(coords)
         
-        centroid = parcel_poly.centroid
-        
-        # Шаг 1: Ищем зону, содержащую центроид
-        for zone in zones:
-            zone_geom = zone.get("geometry")
-            if zone_geom and zone_geom.contains(centroid):
-                logger.info(
-                    f"Участок находится в зоне {zone.get('code')} "
-                    f"{zone.get('name')} (по центроиду)"
-                )
-                return {
-                    "name": zone.get("name", ""),
-                    "code": zone.get("code", ""),
-                }
-        
-        # Шаг 2: Ищем максимальное пересечение
-        max_area = 0.0
-        best_zone = None
+        # Собираем все пересекающиеся зоны с процентом перекрытия
+        intersecting_zones = []
         
         for zone in zones:
-            zone_geom = zone.get("geometry")
-            if not zone_geom:
+            zone_geom = zone.get('geometry')
+            if zone_geom is None:
                 continue
             
-            try:
-                intersection = parcel_poly.intersection(zone_geom)
-                area = intersection.area
+            # Проверяем пересечение
+            if parcel_polygon.intersects(zone_geom):
+                intersection = parcel_polygon.intersection(zone_geom)
+                overlap_percent = (intersection.area / parcel_polygon.area) * 100
                 
-                if area > max_area:
-                    max_area = area
-                    best_zone = zone
-            except Exception as ex:
-                logger.warning(f"Ошибка пересечения с зоной: {ex}")
-                continue
+                intersecting_zones.append({
+                    "code": zone.get('code'),
+                    "name": zone.get('name'),
+                    "overlap_percent": overlap_percent,
+                    "overlap_area": intersection.area,
+                })
+                
+                logger.debug(
+                    f"Зона {zone.get('code')} {zone.get('name')}: "
+                    f"перекрытие {overlap_percent:.1f}%"
+                )
         
-        if best_zone and max_area > 0:
-            logger.info(
-                f"Участок находится в зоне {best_zone.get('code')} "
-                f"{best_zone.get('name')} (по пересечению, {max_area:.2f} кв.м)"
+        if not intersecting_zones:
+            logger.warning("Территориальная зона не найдена для участка")
+            return None
+        
+        # Сортируем по проценту перекрытия (по убыванию)
+        intersecting_zones.sort(key=lambda z: z['overlap_percent'], reverse=True)
+        
+        # Берём зону с максимальным перекрытием
+        best_zone = intersecting_zones[0]
+        
+        # Определяем, попадает ли участок в несколько зон
+        # Флаг устанавливается только если:
+        # 1. Зон больше одной И
+        # 2. Основная зона покрывает менее 100% участка
+        multiple_zones = len(intersecting_zones) > 1 and best_zone['overlap_percent'] < 99.9
+        
+        if multiple_zones:
+            # Логируем, что нашли несколько зон
+            zones_info = ", ".join([
+                f"{z['code']} ({z['overlap_percent']:.1f}%)" 
+                for z in intersecting_zones
+            ])
+            logger.warning(
+                f"⚠️ УЧАСТОК ПЕРЕСЕКАЕТСЯ С НЕСКОЛЬКИМИ ЗОНАМИ: {zones_info}. "
+                f"Выбрана зона с максимальным перекрытием: {best_zone['code']} "
+                f"({best_zone['overlap_percent']:.1f}%)"
             )
-            return {
-                "name": best_zone.get("name", ""),
-                "code": best_zone.get("code", ""),
-            }
+        else:
+            logger.info(
+                f"Зона определена: {best_zone['code']} {best_zone['name']} "
+                f"(перекрытие {best_zone['overlap_percent']:.1f}%)"
+            )
         
-        logger.warning("Не удалось определить зону для участка")
-        return None
+        return {
+            "code": best_zone.get('code'),
+            "name": best_zone.get('name'),
+            "multiple_zones": multiple_zones,
+            "all_zones": intersecting_zones,
+            "overlap_percent": best_zone.get('overlap_percent'),
+        }
         
     except Exception as ex:
-        logger.exception(f"Ошибка определения зоны: {ex}")
+        logger.error(f"Ошибка при определении зоны: {ex}")
         return None
 
-
-# ======================= ПАРСИНГ ОБЪЕКТОВ КАПСТРОИТЕЛЬСТВА ======================= #
 
 def parse_capital_objects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     """
@@ -231,7 +198,7 @@ def parse_capital_objects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
         tab_path: Путь к TAB-файлу
     
     Returns:
-        Список объектов с геометрией и атрибутами
+        Список объектов с геометрией
     """
     gdf = read_tab_file(tab_path)
     if gdf is None or gdf.empty:
@@ -239,69 +206,65 @@ def parse_capital_objects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     
     objects = []
     
+    CADNUM_FIELDS = ["CADNUM", "CAD_NUM", "КадастровыйНомер", "Кадастровый_номер"]
+    TYPE_FIELDS = ["TYPE", "OBJECT_TYPE", "Тип", "ТИП"]
+    PURPOSE_FIELDS = ["PURPOSE", "Назначение", "НАЗНАЧЕНИЕ"]
+    AREA_FIELDS = ["AREA", "Площадь", "ПЛОЩАДЬ"]
+    FLOORS_FIELDS = ["FLOORS", "Этажность", "ЭТАЖНОСТЬ"]
+    
     for idx, row in gdf.iterrows():
         obj = {
-            "cadnum": get_field_value(row, FieldMapping.OBJECT_CADNUM_FIELDS),
-            "object_type": get_field_value(row, FieldMapping.OBJECT_TYPE_FIELDS),
-            "purpose": get_field_value(row, FieldMapping.OBJECT_PURPOSE_FIELDS),
-            "area": get_field_value(row, FieldMapping.OBJECT_AREA_FIELDS),
-            "floors": get_field_value(row, FieldMapping.OBJECT_FLOORS_FIELDS),
+            "cadnum": get_field_value(row, CADNUM_FIELDS),
+            "object_type": get_field_value(row, TYPE_FIELDS),
+            "purpose": get_field_value(row, PURPOSE_FIELDS),
+            "area": get_field_value(row, AREA_FIELDS),
+            "floors": get_field_value(row, FLOORS_FIELDS),
             "geometry": row.get('geometry'),
         }
         objects.append(obj)
     
-    logger.info(f"Загружено объектов из {Path(tab_path).name}: {len(objects)}")
+    logger.info(f"Загружено объектов капстроительства из {Path(tab_path).name}: {len(objects)}")
     return objects
 
 
-def find_objects_on_parcel(
-    parcel_coords: List[Tuple[float, float]],
-    objects: List[Dict[str, Any]]
-) -> List[Dict[str, str]]:
+def find_objects_on_parcel(coords: List[Tuple[float, float]], objects: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """
-    Найти объекты капстроительства, расположенные на участке.
+    Найти объекты капстроительства на участке.
     
     Args:
-        parcel_coords: Координаты участка
-        objects: Список объектов из parse_capital_objects_layer()
+        coords: Координаты участка
+        objects: Список объектов с геометрией
     
     Returns:
-        Список объектов на участке
+        Список найденных объектов
     """
-    if not parcel_coords or not objects:
+    if not coords or len(coords) < 3:
         return []
     
     try:
-        parcel_poly = Polygon(parcel_coords)
-        if not parcel_poly.is_valid:
-            parcel_poly = parcel_poly.buffer(0)
-        
+        parcel_polygon = Polygon(coords)
         found = []
         
         for obj in objects:
-            obj_geom = obj.get("geometry")
-            if not obj_geom:
+            obj_geom = obj.get('geometry')
+            if obj_geom is None:
                 continue
             
-            # Проверяем пересечение
-            if check_geometry_intersects(parcel_poly, obj_geom):
+            if parcel_polygon.intersects(obj_geom):
                 found.append({
-                    "cadnum": obj.get("cadnum", ""),
-                    "object_type": obj.get("object_type", ""),
-                    "purpose": obj.get("purpose", ""),
-                    "area": obj.get("area", ""),
-                    "floors": obj.get("floors", ""),
+                    "cadnum": obj.get('cadnum'),
+                    "object_type": obj.get('object_type'),
+                    "purpose": obj.get('purpose'),
+                    "area": obj.get('area'),
+                    "floors": obj.get('floors'),
                 })
         
-        logger.info(f"Найдено объектов на участке: {len(found)}")
         return found
         
     except Exception as ex:
-        logger.exception(f"Ошибка поиска объектов: {ex}")
+        logger.error(f"Ошибка при поиске объектов: {ex}")
         return []
 
-
-# ======================= ПАРСИНГ ПРОЕКТОВ ПЛАНИРОВКИ ======================= #
 
 def parse_planning_projects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     """
@@ -319,12 +282,20 @@ def parse_planning_projects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     
     projects = []
     
+    # Определяем названия полей (с учётом возможных вариантов)
+    PROJECT_TYPE_FIELDS = ["Вид_проекта", "PROJECT_TYPE", "ВидПроекта", "Вид", "TYPE"]
+    PROJECT_NAME_FIELDS = ["Наименование_проекта", "PROJECT_NAME", "NAME", "Наименование", "НАИМЕНОВАНИЕ"]
+    DECISION_NUMBER_FIELDS = ["Номер_распоряжения", "DECISION_NUMBER", "DEC_NUM", "НомерРешения", "Номер_решения", "НОМЕР_РЕШЕНИЯ", "Номер"]
+    DECISION_DATE_FIELDS = ["Дата_распоряжения", "DECISION_DATE", "DEC_DATE", "ДатаРешения", "Дата_решения", "ДАТА_РЕШЕНИЯ", "Дата"]
+    DECISION_AUTHORITY_FIELDS = ["DECISION_AUTHORITY", "AUTHORITY", "ОрганУтвердивший", "Орган", "ОРГАН"]
+    
     for idx, row in gdf.iterrows():
         project = {
-            "project_name": get_field_value(row, FieldMapping.PROJECT_NAME_FIELDS),
-            "decision_number": get_field_value(row, FieldMapping.DECISION_NUMBER_FIELDS),
-            "decision_date": get_field_value(row, FieldMapping.DECISION_DATE_FIELDS),
-            "decision_authority": get_field_value(row, FieldMapping.DECISION_AUTHORITY_FIELDS),
+            "project_type": get_field_value(row, PROJECT_TYPE_FIELDS),
+            "project_name": get_field_value(row, PROJECT_NAME_FIELDS),
+            "decision_number": get_field_value(row, DECISION_NUMBER_FIELDS),
+            "decision_date": get_field_value(row, DECISION_DATE_FIELDS),
+            "decision_authority": get_field_value(row, DECISION_AUTHORITY_FIELDS),
             "geometry": row.get('geometry'),
         }
         projects.append(project)
@@ -333,68 +304,54 @@ def parse_planning_projects_layer(tab_path: Path | str) -> List[Dict[str, Any]]:
     return projects
 
 
-def check_planning_project_intersection(
-    parcel_coords: List[Tuple[float, float]],
-    projects: List[Dict[str, Any]]
-) -> Optional[Dict[str, str]]:
+def check_planning_project_intersection(coords: List[Tuple[float, float]], projects: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """
-    Проверить, попадает ли участок в границы проекта планировки.
+    Проверить попадание участка в границы проекта планировки.
     
     Args:
-        parcel_coords: Координаты участка
-        projects: Список проектов из parse_planning_projects_layer()
+        coords: Координаты участка
+        projects: Список проектов с геометрией
     
     Returns:
-        Информация о проекте планировки или None
+        Информация о проекте или None
     """
-    if not parcel_coords or not projects:
+    if not coords or len(coords) < 3:
         return None
     
     try:
-        parcel_poly = Polygon(parcel_coords)
-        if not parcel_poly.is_valid:
-            parcel_poly = parcel_poly.buffer(0)
+        parcel_polygon = Polygon(coords)
         
         for project in projects:
-            proj_geom = project.get("geometry")
-            if not proj_geom:
+            proj_geom = project.get('geometry')
+            if proj_geom is None:
                 continue
             
-            if check_geometry_intersects(parcel_poly, proj_geom):
-                logger.info(
-                    f"Участок входит в проект планировки: "
-                    f"{project.get('project_name')}"
-                )
+            if parcel_polygon.intersects(proj_geom):
                 return {
-                    "project_name": project.get("project_name", ""),
-                    "decision_number": project.get("decision_number", ""),
-                    "decision_date": project.get("decision_date", ""),
-                    "decision_authority": project.get("decision_authority", ""),
+                    "project_type": project.get('project_type'),
+                    "project_name": project.get('project_name'),
+                    "decision_number": project.get('decision_number'),
+                    "decision_date": project.get('decision_date'),
+                    "decision_authority": project.get('decision_authority'),
                 }
         
-        logger.info("Участок не входит в границы проектов планировки")
         return None
         
     except Exception as ex:
-        logger.exception(f"Ошибка проверки ППТ: {ex}")
+        logger.error(f"Ошибка при проверке ППТ: {ex}")
         return None
 
 
-# ======================= ПАРСИНГ ОГРАНИЧЕНИЙ (ЗОУИТ, АГО, КРТ) ======================= #
-
-def parse_restrictions_layer(
-    tab_path: Path | str,
-    restriction_type: str
-) -> List[Dict[str, Any]]:
+def parse_zouit_layer_extended(tab_path: Path | str, zone_type: str = "ЗОУИТ") -> List[Dict[str, Any]]:
     """
-    Парсинг слоя с ограничениями (ЗОУИТ, АГО, КРТ и т.д.).
+    Парсинг слоя ЗОУИТ с расширенными полями (включая реестровый номер).
     
     Args:
         tab_path: Путь к TAB-файлу
-        restriction_type: Тип ограничения (для логирования)
+        zone_type: Тип зоны (для идентификации)
     
     Returns:
-        Список зон ограничений с геометрией
+        Список зон с ограничениями
     """
     gdf = read_tab_file(tab_path)
     if gdf is None or gdf.empty:
@@ -402,107 +359,92 @@ def parse_restrictions_layer(
     
     restrictions = []
     
+    # Определяем названия полей для ЗОУИТ
+    NAME_FIELDS = [
+        "Вид_или_наименование_по_доку_8",  # Полное описание
+        "Полное_наименование",              # Краткое название
+        "Наименование",                     # Название
+        "NAME", 
+        "НАИМЕНОВАНИЕ", 
+        "Название"
+    ]
+    REGISTRY_FIELDS = [
+        "Реестровый_номер_границы",        # Реестровый номер границы
+        "REGISTRY_NUMBER", 
+        "РеестровыйНомер", 
+        "Реестровый_номер", 
+        "УчетныйНомер"
+    ]
+    DECISION_NUMBER_FIELDS = [
+        "Номер",
+        "DECISION_NUMBER", 
+        "НомерРешения", 
+        "Номер_решения"
+    ]
+    DECISION_DATE_FIELDS = [
+        "Дата_регистрации",                # Дата регистрации
+        "Дата_создания",                    # Дата создания (альтернатива)
+        "DECISION_DATE", 
+        "ДатаРешения", 
+        "Дата_решения"
+    ]
+    DECISION_AUTHORITY_FIELDS = [
+        "DECISION_AUTHORITY", 
+        "ОрганУтвердивший", 
+        "Орган"
+    ]
+    
     for idx, row in gdf.iterrows():
-        restr = {
-            "zone_type": restriction_type,
-            "name": get_field_value(row, FieldMapping.RESTRICTION_NAME_FIELDS),
-            "decision_number": get_field_value(row, FieldMapping.DECISION_NUMBER_FIELDS),
-            "decision_date": get_field_value(row, FieldMapping.DECISION_DATE_FIELDS),
-            "decision_authority": get_field_value(row, FieldMapping.DECISION_AUTHORITY_FIELDS),
+        restriction = {
+            "zone_type": zone_type,
+            "name": get_field_value(row, NAME_FIELDS),
+            "registry_number": get_field_value(row, REGISTRY_FIELDS),
+            "decision_number": get_field_value(row, DECISION_NUMBER_FIELDS),
+            "decision_date": get_field_value(row, DECISION_DATE_FIELDS),
+            "decision_authority": get_field_value(row, DECISION_AUTHORITY_FIELDS),
             "geometry": row.get('geometry'),
         }
-        restrictions.append(restr)
+        restrictions.append(restriction)
     
-    logger.info(
-        f"Загружено ограничений ({restriction_type}) "
-        f"из {Path(tab_path).name}: {len(restrictions)}"
-    )
+    logger.info(f"Загружено ограничений из {Path(tab_path).name}: {len(restrictions)}")
     return restrictions
 
 
-def find_restrictions_for_parcel(
-    parcel_coords: List[Tuple[float, float]],
-    restrictions: List[Dict[str, Any]]
-) -> List[Dict[str, str]]:
+def find_restrictions_for_parcel(coords: List[Tuple[float, float]], restrictions: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """
-    Найти ограничения, которые пересекаются с участком.
+    Найти ограничения для участка.
     
     Args:
-        parcel_coords: Координаты участка
-        restrictions: Список ограничений из parse_restrictions_layer()
+        coords: Координаты участка
+        restrictions: Список ограничений с геометрией
     
     Returns:
-        Список пересекающихся ограничений
+        Список найденных ограничений
     """
-    if not parcel_coords or not restrictions:
+    if not coords or len(coords) < 3:
         return []
     
     try:
-        parcel_poly = Polygon(parcel_coords)
-        if not parcel_poly.is_valid:
-            parcel_poly = parcel_poly.buffer(0)
-        
+        parcel_polygon = Polygon(coords)
         found = []
         
         for restr in restrictions:
-            restr_geom = restr.get("geometry")
-            if not restr_geom:
+            restr_geom = restr.get('geometry')
+            if restr_geom is None:
                 continue
             
-            if check_geometry_intersects(parcel_poly, restr_geom):
+            if parcel_polygon.intersects(restr_geom):
                 found.append({
-                    "zone_type": restr.get("zone_type", ""),
-                    "name": restr.get("name", ""),
-                    "registry_number": restr.get("registry_number", ""),
-                    "decision_number": restr.get("decision_number", ""),
-                    "decision_date": restr.get("decision_date", ""),
-                    "decision_authority": restr.get("decision_authority", ""),
+                    "zone_type": restr.get('zone_type'),
+                    "name": restr.get('name'),
+                    "registry_number": restr.get('registry_number'),
+                    "decision_number": restr.get('decision_number'),
+                    "decision_date": restr.get('decision_date'),
+                    "decision_authority": restr.get('decision_authority'),
                 })
-        
-        if found:
-            logger.info(
-                f"Найдено ограничений типа {restrictions[0].get('zone_type', '?')}: "
-                f"{len(found)}"
-            )
         
         return found
         
     except Exception as ex:
-        logger.exception(f"Ошибка поиска ограничений: {ex}")
+        logger.error(f"Ошибка при поиске ограничений: {ex}")
         return []
-# Добавляем в конец файла функцию для ЗОУИТ с реестровым номером
-def parse_zouit_layer_extended(tab_path, restriction_type: str) -> List[Dict[str, Any]]:
-    """
-    Парсинг ЗОУИТ с извлечением реестрового номера.
-    """
-    gdf = read_tab_file(tab_path)
-    if gdf is None or gdf.empty:
-        return []
-    
-    restrictions = []
-    
-    for idx, row in gdf.iterrows():
-        # Извлекаем реестровый номер
-        registry_number = get_field_value(row, [
-            "Реестровый_номер_границы",
-            "REGISTRY_NUMBER",
-            "Реестровый_номер"
-        ])
-        
-        restr = {
-            "zone_type": restriction_type,
-            "name": get_field_value(row, [
-                "Вид_или_наименование_по_доку_8",
-                "Наименование",
-                "Полное_наименование"
-            ]),
-            "registry_number": registry_number,
-            "decision_number": get_field_value(row, ["Номер"]),
-            "decision_date": get_field_value(row, ["Дата_регистрации"]),
-            "decision_authority": None,
-            "geometry": row.get('geometry'),
-        }
-        restrictions.append(restr)
-    
-    logger.info(f"Загружено ЗОУИТ из {Path(tab_path).name}: {len(restrictions)}")
-    return restrictions

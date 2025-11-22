@@ -6,7 +6,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any
-from datetime import date
+from datetime import date, datetime
 import json
 
 
@@ -45,6 +45,35 @@ class TerritorialZoneInfo:
     vri_auxiliary: List[str] = field(default_factory=list)
     parameters: Dict[str, Any] = field(default_factory=dict)
     act_reference: Optional[str] = None
+    
+    # Внутренние поля (не выводятся в JSON через to_dict)
+    _multiple_zones: bool = False  # Попадает ли участок в несколько зон
+    _all_zones: List[Dict[str, Any]] = field(default_factory=list)  # Все пересекающиеся зоны
+    _overlap_percent: Optional[float] = None  # Процент перекрытия с выбранной зоной
+    
+    @property
+    def multiple_zones(self) -> bool:
+        return self._multiple_zones
+    
+    @multiple_zones.setter
+    def multiple_zones(self, value: bool):
+        self._multiple_zones = value
+    
+    @property
+    def all_zones(self) -> List[Dict[str, Any]]:
+        return self._all_zones
+    
+    @all_zones.setter
+    def all_zones(self, value: List[Dict[str, Any]]):
+        self._all_zones = value
+    
+    @property
+    def overlap_percent(self) -> Optional[float]:
+        return self._overlap_percent
+    
+    @overlap_percent.setter
+    def overlap_percent(self, value: Optional[float]):
+        self._overlap_percent = value
 
 
 @dataclass
@@ -62,12 +91,78 @@ class CapitalObject:
 class PlanningProject:
     """Проект планировки территории"""
     exists: bool = False
-    decision_number: Optional[str] = None
-    decision_date: Optional[str] = None
-    decision_authority: Optional[str] = None
-    decision_full: Optional[str] = None
-    project_name: Optional[str] = None
-    territory: Optional[str] = None
+    project_type: Optional[str] = None          # Вид проекта (проект планировки/межевания)
+    project_name: Optional[str] = None          # Наименование проекта
+    decision_number: Optional[str] = None       # Номер распоряжения
+    decision_date: Optional[str] = None         # Дата распоряжения
+    decision_authority: Optional[str] = None    # Орган (если есть)
+    decision_full: Optional[str] = None         # Полная строка решения (формируется)
+    territory: Optional[str] = None             # Территория (если есть)
+    
+    def get_formatted_description(self) -> str:
+        """
+        Получить форматированное описание проекта.
+        
+        Формат:
+        "{Вид_проекта} "{Наименование_проекта}", утвержденного распоряжением 
+        от {Дата_распоряжения} № {Номер_распоряжения}"
+        
+        Или "Документация по планировке территории не утверждена" если проект не найден.
+        """
+        if not self.exists:
+            return "Документация по планировке территории не утверждена"
+        
+        parts = []
+        
+        # Вид проекта
+        if self.project_type:
+            parts.append(self.project_type.capitalize())
+        
+        # Наименование в кавычках
+        if self.project_name:
+            parts.append(f'"{self.project_name}"')
+        
+        # Если есть хоть что-то из вида/названия, добавляем "утвержденного"
+        if parts:
+            parts.append("утвержденного")
+        
+        # Распоряжение
+        decision_parts = []
+        if self.decision_authority:
+            decision_parts.append(self.decision_authority)
+        else:
+            decision_parts.append("распоряжением")
+        
+        if self.decision_date:
+            # Форматируем дату
+            try:
+                date_str = str(self.decision_date).split()[0]  # Берём только дату без времени
+                
+                # Пробуем разные форматы
+                for fmt in ["%Y-%m-%d", "%d.%m.%Y"]:
+                    try:
+                        dt = datetime.strptime(date_str, fmt)
+                        formatted_date = dt.strftime("%d.%m.%Y")
+                        decision_parts.append(f"от {formatted_date}")
+                        break
+                    except:
+                        continue
+                else:
+                    # Если не удалось распарсить, используем как есть
+                    decision_parts.append(f"от {self.decision_date}")
+            except:
+                decision_parts.append(f"от {self.decision_date}")
+        
+        if self.decision_number:
+            decision_parts.append(f"№ {self.decision_number}")
+        
+        if decision_parts:
+            parts.append(" ".join(decision_parts))
+        
+        if parts:
+            return " ".join(parts)
+        else:
+            return "Документация по планировке территории не утверждена"
 
 
 @dataclass
@@ -75,7 +170,7 @@ class RestrictionZone:
     """Зона с особыми условиями использования территории"""
     zone_type: str
     name: Optional[str] = None
-    registry_number: Optional[str] = None  # ДОБАВЛЕНО
+    registry_number: Optional[str] = None
     decision_number: Optional[str] = None
     decision_date: Optional[str] = None
     decision_authority: Optional[str] = None
@@ -114,9 +209,25 @@ class GPData:
     warnings: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """
+        Возвращает словарь только с данными для шаблона.
+        
+        НЕ включает:
+        - warnings (они для пользователя, не для шаблона)
+        - errors (они для пользователя, не для шаблона)
+        - внутренние поля зоны (_multiple_zones, _all_zones, _overlap_percent)
+        """
+        # Используем asdict, но убираем лишнее
+        data = asdict(self)
+        
+        # Убираем warnings и errors
+        data.pop('warnings', None)
+        data.pop('errors', None)
+        
+        return data
     
     def to_json(self, indent: int = 2) -> str:
+        """Возвращает JSON только с данными для шаблона"""
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
     
     def add_error(self, error: str):
@@ -132,6 +243,10 @@ class GPData:
         return self.zouit + self.ago + self.krt + self.okn + self.other_restrictions
     
     def get_summary(self) -> str:
+        """
+        Возвращает текстовую сводку для отправки пользователю в Telegram.
+        Текст БЕЗ экранирования, т.к. не используется parse_mode='Markdown'.
+        """
         lines = []
         lines.append("📊 СВОДКА ДАННЫХ ДЛЯ ГРАДПЛАНА\n")
         
@@ -148,18 +263,48 @@ class GPData:
         
         lines.append("📍 ТЕРРИТОРИАЛЬНАЯ ЗОНА:")
         if self.zone.code or self.zone.name:
-            lines.append(f"  {self.zone.code or ''} {self.zone.name or ''}")
+            zone_text = f"{self.zone.code or ''} {self.zone.name or ''}"
+            lines.append(f"  {zone_text}")
+            
+            # Если участок в нескольких зонах, показываем это
+            if self.zone.multiple_zones and self.zone.all_zones:
+                lines.append(f"  ⚠️ Участок пересекается с несколькими зонами:")
+                for z in self.zone.all_zones:
+                    zone_code = z.get('code', '')
+                    zone_name = z.get('name', '')
+                    overlap = z.get('overlap_percent', 0)
+                    lines.append(f"     • {zone_code} {zone_name} ({overlap:.1f}%)")
+                lines.append(f"  ✅ Выбрана зона с максимальным перекрытием")
         else:
             lines.append("  Не определена")
         lines.append("")
         
         lines.append("🏢 ОБЪЕКТЫ КАПСТРОИТЕЛЬСТВА:")
-        lines.append(f"  Найдено: {len(self.capital_objects)} шт.")
-        lines.append("")
+        if self.capital_objects:
+            lines.append(f"  Найдено: {len(self.capital_objects)} шт.")
+            lines.append("")
+            for i, obj in enumerate(self.capital_objects, 1):
+                lines.append(f"  {i}. Кадастровый номер: {obj.cadnum or 'не указан'}")
+                if obj.object_type:
+                    lines.append(f"     Тип: {obj.object_type}")
+                if obj.purpose:
+                    lines.append(f"     Назначение: {obj.purpose}")
+                if obj.area:
+                    lines.append(f"     Площадь: {obj.area} кв. м")
+                if obj.floors:
+                    lines.append(f"     Этажность: {obj.floors}")
+                lines.append("")
+        else:
+            lines.append("  Не найдено")
+            lines.append("")
         
         lines.append("📋 ПРОЕКТ ПЛАНИРОВКИ:")
         if self.planning_project.exists:
             lines.append(f"  Участок входит в границы ППТ")
+            if self.planning_project.project_type:
+                lines.append(f"  Вид: {self.planning_project.project_type}")
+            if self.planning_project.decision_full:
+                lines.append(f"  {self.planning_project.decision_full}")
         else:
             lines.append("  Не входит в границы ППТ")
         lines.append("")
@@ -211,10 +356,19 @@ def create_gp_data_from_parsed(
     coords_dicts = []
     if coords_list:
         for c in coords_list:
+            # ВАЖНО: Меняем X и Y местами для JSON (как в слоях)
+            # ЕГРН: X (север), Y (восток)
+            # JSON/Слои: Y (восток), X (север)
             if hasattr(c, 'num'):
-                coords_dicts.append({'num': c.num, 'x': c.x, 'y': c.y})
+                # Меняем местами: x становится y, y становится x
+                coords_dicts.append({'num': c.num, 'x': c.y, 'y': c.x})
             elif isinstance(c, dict):
-                coords_dicts.append(c)
+                # Если уже dict, тоже меняем местами
+                coords_dicts.append({
+                    'num': c.get('num'),
+                    'x': c.get('y'),  # Меняем местами
+                    'y': c.get('x')   # Меняем местами
+                })
     
     gp.parcel = ParcelInfo(
         cadnum=egrn_dict.get('cadnum'),

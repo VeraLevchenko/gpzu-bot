@@ -24,7 +24,7 @@ from parsers.tab_parser import (
     find_objects_on_parcel,
     parse_planning_projects_layer,
     check_planning_project_intersection,
-    parse_zouit_layer_extended,  # Используем расширенную версию
+    parse_zouit_layer_extended,
     find_restrictions_for_parcel,
 )
 
@@ -63,7 +63,18 @@ def perform_spatial_analysis(gp_data: GPData) -> GPData:
 
 
 def _get_parcel_coords(gp_data: GPData) -> List[Tuple[float, float]]:
-    """Извлечь координаты участка"""
+    """
+    Извлечь координаты участка.
+    
+    ВАЖНО: Координаты в gp_data.parcel.coordinates УЖЕ в порядке (Y, X),
+    т.к. они были преобразованы при создании GPData в create_gp_data_from_parsed().
+    
+    ЕГРН изначально: X (север), Y (восток)
+    В JSON/GPData: x=Y (восток), y=X (север) - УЖЕ ПОМЕНЯНЫ!
+    
+    Returns:
+        List[(y, x)] - координаты в формате для Shapely (восток, север)
+    """
     coords_list = gp_data.parcel.coordinates
     if not coords_list:
         return []
@@ -71,14 +82,26 @@ def _get_parcel_coords(gp_data: GPData) -> List[Tuple[float, float]]:
     result = []
     for coord in coords_list:
         try:
-            x_str = coord.get('x', '')
-            y_str = coord.get('y', '')
+            # В JSON координаты УЖЕ поменяны местами:
+            # coord['x'] = это Y из ЕГРН (восток)
+            # coord['y'] = это X из ЕГРН (север)
+            x_str = coord.get('x', '')  # Это Y (восток)
+            y_str = coord.get('y', '')  # Это X (север)
             x = float(x_str.replace(',', '.').replace(' ', ''))
             y = float(y_str.replace(',', '.').replace(' ', ''))
+            
+            # Для Shapely нужен порядок (восток, север), т.е. (x, y)
+            # Координаты уже в правильном порядке!
             result.append((x, y))
+            
+            logger.debug(f"Координата из JSON: x(восток)={x}, y(север)={y} → ({x}, {y}) для Shapely")
+            
         except (ValueError, AttributeError, KeyError) as ex:
             logger.warning(f"Ошибка парсинга координаты: {ex}")
             continue
+    
+    if result:
+        logger.info(f"Извлечено {len(result)} координат (уже в формате Y,X для анализа)")
     
     return result
 
@@ -100,10 +123,34 @@ def _analyze_zone(gp_data: GPData, coords: List[Tuple[float, float]]):
         
         zone_info = find_zone_for_parcel(coords, zones)
         if zone_info:
-            gp_data.zone = TerritorialZoneInfo(
+            # Создаём объект зоны
+            zone = TerritorialZoneInfo(
                 name=zone_info.get('name'),
                 code=zone_info.get('code'),
             )
+            
+            # Устанавливаем дополнительную информацию через свойства
+            zone.multiple_zones = zone_info.get('multiple_zones', False)
+            zone.all_zones = zone_info.get('all_zones', [])
+            zone.overlap_percent = zone_info.get('overlap_percent')
+            
+            gp_data.zone = zone
+            
+            # Добавляем предупреждение, если участок в нескольких зонах
+            if zone_info.get('multiple_zones'):
+                all_zones_list = zone_info.get('all_zones', [])
+                zones_text = ", ".join([
+                    f"{z['code']} ({z['overlap_percent']:.1f}%)"
+                    for z in all_zones_list
+                ])
+                warning_msg = (
+                    f"⚠️ Участок пересекается с несколькими территориальными зонами: {zones_text}. "
+                    f"Выбрана зона с максимальным перекрытием: {zone_info.get('code')} "
+                    f"({zone_info.get('overlap_percent'):.1f}%)"
+                )
+                gp_data.add_warning(warning_msg)
+                logger.warning(warning_msg)
+            
             logger.info(f"Зона определена: {zone_info.get('code')} {zone_info.get('name')}")
         else:
             logger.warning("Не удалось определить зону участка")
@@ -157,39 +204,54 @@ def _analyze_planning_projects(gp_data: GPData, coords: List[Tuple[float, float]
         msg = f"Слой ППТ не найден: {LayerPaths.PLANNING_PROJECTS}"
         logger.warning(msg)
         gp_data.add_warning(msg)
+        # ВАЖНО: Устанавливаем объект с exists=False и заполненным decision_full
+        gp_data.planning_project = PlanningProject(exists=False)
+        gp_data.planning_project.decision_full = gp_data.planning_project.get_formatted_description()
         return
     
     try:
         projects = parse_planning_projects_layer(LayerPaths.PLANNING_PROJECTS)
         if not projects:
             logger.info("Слой проектов планировки пуст")
+            # ВАЖНО: Устанавливаем объект с exists=False и заполненным decision_full
+            gp_data.planning_project = PlanningProject(exists=False)
+            gp_data.planning_project.decision_full = gp_data.planning_project.get_formatted_description()
             return
         
         project_info = check_planning_project_intersection(coords, projects)
         if project_info:
-            decision_full = _format_decision(
-                project_info.get('decision_number'),
-                project_info.get('decision_date'),
-                project_info.get('decision_authority'),
-            )
-            
-            gp_data.planning_project = PlanningProject(
+            # Создаём объект с новыми полями
+            planning_project = PlanningProject(
                 exists=True,
+                project_type=project_info.get('project_type'),
+                project_name=project_info.get('project_name'),
                 decision_number=project_info.get('decision_number'),
                 decision_date=project_info.get('decision_date'),
                 decision_authority=project_info.get('decision_authority'),
-                decision_full=decision_full,
-                project_name=project_info.get('project_name'),
             )
-            logger.info("Участок входит в границы ППТ")
+            
+            # ВАЖНО: Формируем полное описание
+            planning_project.decision_full = planning_project.get_formatted_description()
+            
+            gp_data.planning_project = planning_project
+            
+            logger.info(
+                f"Участок входит в границы ППТ: {project_info.get('project_type')} "
+                f'"{project_info.get("project_name")}"'
+            )
         else:
+            # ВАЖНО: Устанавливаем объект с exists=False и заполненным decision_full
             gp_data.planning_project = PlanningProject(exists=False)
+            gp_data.planning_project.decision_full = gp_data.planning_project.get_formatted_description()
             logger.info("Участок не входит в границы ППТ")
             
     except Exception as ex:
         msg = f"Ошибка при проверке ППТ: {ex}"
         logger.exception(msg)
         gp_data.add_error(msg)
+        # ВАЖНО: Устанавливаем объект с exists=False и заполненным decision_full в случае ошибки
+        gp_data.planning_project = PlanningProject(exists=False)
+        gp_data.planning_project.decision_full = gp_data.planning_project.get_formatted_description()
 
 
 def _analyze_zouit(gp_data: GPData, coords: List[Tuple[float, float]]):

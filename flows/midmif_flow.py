@@ -43,6 +43,8 @@ async def midmif_got_egrn(m: Message, state: FSMContext):
     """
     Принимаем выписку ЕГРН, парсим контуры, пересчитываем номера точек,
     показываем координаты пользователю и формируем MID/MIF.
+    
+    ВАЖНО: Координаты выводятся в порядке Y, X (как требуется для пространственного анализа)
     """
     doc: TgDocument = m.document
 
@@ -118,7 +120,7 @@ async def midmif_got_egrn(m: Message, state: FSMContext):
 
         numbered_contours.append(contour_numbered)
 
-    # 4. Выводим пользователю координаты (в том порядке, как в выписке, уже с новыми номерами)
+    # 4. Выводим пользователю координаты в порядке Y, X (как в слоях)
     all_points: List[ECoord] = [pt for cnt in numbered_contours for pt in cnt]
     cad = egrn.cadnum or "—"
     total = len(all_points)
@@ -126,17 +128,22 @@ async def midmif_got_egrn(m: Message, state: FSMContext):
     lines: List[str] = []
     lines.append(
         f"Координаты контуров земельного участка *{cad}* "
-        f"(точек: {total}, включая замыкающие):"
+        f"(точек: {total}, включая замыкающие):\n"
     )
+    lines.append("⚠️ *Координаты в порядке Y (восток), X (север) — как в пространственных слоях*\n")
     lines.append("```")
-    lines.append(f"{'№':>4} {'X':>20} {'Y':>20}")
+    lines.append(f"{'№':>4} {'Y (восток)':>20} {'X (север)':>20}")
+    
+    # Выводим Y, X (меняем местами по сравнению с ЕГРН)
     for c in all_points:
-        lines.append(f"{c.num:>4} {c.x:>20} {c.y:>20}")
+        lines.append(f"{c.num:>4} {c.y:>20} {c.x:>20}")
+    
     lines.append("```")
 
     await m.answer("\n".join(lines), parse_mode="Markdown")
 
     # 5. Формируем структуру для билдера: список контуров [[(num, x, y), ...], ...]
+    # Для MID/MIF оставляем исходный порядок X, Y
     contours_for_builder: List[List[tuple[str, str, str]]] = []
     for cnt in numbered_contours:
         contours_for_builder.append([(c.num, c.x, c.y) for c in cnt])
