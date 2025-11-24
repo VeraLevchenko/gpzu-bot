@@ -1,8 +1,33 @@
 # flows/tu_flow.py
+"""
+Сценарий подготовки запросов технических условий (ТУ).
+
+НОВЫЙ АЛГОРИТМ:
+
+1. Пользователь выбирает способ ввода данных:
+   - Прикрепить заявление (DOCX) - парсится автоматически
+   - Ввести данные вручную
+
+2. Если прикреплено заявление:
+   - Парсим номер, дату, заявителя
+   - Просим прикрепить выписку ЕГРН
+   - Парсим кадастровый номер, адрес, площадь, ВРИ
+   - Формируем ТУ с регистрацией
+
+3. Если ввод вручную:
+   - Просим номер заявления
+   - Просим дату заявления
+   - Просим заявителя
+   - Просим кадастровый номер
+   - Просим адрес (опционально - можно взять из ЕГРН)
+   - Просим выписку ЕГРН для площади и ВРИ
+   - Формируем ТУ с регистрацией
+"""
+
 import os
 import tempfile
 import logging
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -17,10 +42,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.utils import download_with_retries
 from parsers.egrn_parser import parse_egrn_xml, EGRNData
-from generator.tu_requests_builder import (
-    build_tu_docs,
-    build_tu_docs_with_outgoing,
-)
+from parsers.application_parser import parse_application_docx, ApplicationData
+from generator.tu_requests_builder import build_tu_docs_with_outgoing
 
 logger = logging.getLogger("gpzu-bot.tu")
 
@@ -29,334 +52,384 @@ tu_router = Router()
 
 # ----------------------------- СОСТОЯНИЯ ----------------------------- #
 class TUStates(StatesGroup):
-    WAIT_INCOMING = State()  # ждём строку "124245 от 01.11.2025"
-    WAIT_EGRN = State()      # ждём файл выписки
-    WAIT_ACTION = State()    # ждём выбор способа подготовки ТУ
+    WAIT_INPUT_METHOD = State()  # выбор: заявление или ручной ввод
+    
+    # Ветка: прикрепить заявление
+    WAIT_APPLICATION_DOC = State()  # ждём файл заявления
+    WAIT_EGRN_AFTER_APP = State()   # ждём ЕГРН после заявления
+    
+    # Ветка: ручной ввод
+    WAIT_MANUAL_APP_NUM = State()    # номер заявления
+    WAIT_MANUAL_APP_DATE = State()   # дата заявления
+    WAIT_MANUAL_APPLICANT = State()  # заявитель
+    WAIT_MANUAL_CADNUM = State()     # кадастровый номер
+    WAIT_MANUAL_ADDRESS = State()    # адрес (опционально)
+    WAIT_MANUAL_EGRN = State()       # выписка ЕГРН
 
 
 # --------------------------- КЛАВИАТУРЫ --------------------------- #
-def _next_button() -> InlineKeyboardBuilder:
+def _input_method_keyboard() -> InlineKeyboardBuilder:
+    """Выбор способа ввода данных."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="Далее", callback_data="tu:next")
+    kb.button(text="📄 Прикрепить заявление (DOCX)", callback_data="tu:attach_app")
+    kb.button(text="⌨️ Ввести данные вручную", callback_data="tu:manual")
     kb.adjust(1)
     return kb
 
 
-def _tu_mode_keyboard() -> InlineKeyboardBuilder:
+def _skip_address_keyboard() -> InlineKeyboardBuilder:
+    """Кнопка пропустить адрес."""
     kb = InlineKeyboardBuilder()
-    kb.button(
-        text="Подготовить ТУ с исходящим номером и датой",
-        callback_data="tu:with_outgoing",
-    )
-    kb.button(
-        text="Подготовить ТУ для последующей самостоятельной регистрации",
-        callback_data="tu:without_outgoing",
-    )
+    kb.button(text="Пропустить (взять из ЕГРН)", callback_data="tu:skip_address")
     kb.adjust(1)
     return kb
-
-
-# ------------------------ ХРАНЕНИЕ EGRN В FSM ------------------------ #
-def _egrn_to_state(e: EGRNData) -> Dict[str, Any]:
-    """
-    Сохраняем только те поля, которые реально используются в шаблонах ТУ.
-    Остальные в EGRNData имеют значения по умолчанию.
-    """
-    return {
-        "cadnum": e.cadnum,
-        "address": e.address,
-        "area": e.area,
-        "permitted_use": getattr(e, "permitted_use", None),
-    }
-
-
-def _egrn_from_state(d: Dict[str, Any]) -> EGRNData:
-    """
-    Восстанавливаем EGRNData из dict.
-    Благодаря значениям по умолчанию в dataclass можно передавать только часть полей.
-    """
-    return EGRNData(
-        cadnum=d.get("cadnum"),
-        address=d.get("address"),
-        area=d.get("area"),
-        permitted_use=d.get("permitted_use"),
-    )
 
 
 # ------------------------------ ВХОД В СЦЕНАРИЙ ------------------------------ #
 @tu_router.message(F.text == "3. Подготовить запросы ТУ")
 async def tu_entry(m: Message, state: FSMContext):
-    """
-    Старт сценария подготовки запросов ТУ.
-    """
+    """Старт сценария подготовки запросов ТУ."""
     await state.clear()
-    await state.set_state(TUStates.WAIT_INCOMING)
+    await state.set_state(TUStates.WAIT_INPUT_METHOD)
 
     await m.answer(
-        "Подготовка запросов ТУ.\n\n"
-        "Шаг 1. Введите входящий номер заявления и входящую дату в формате:\n"
-        "124245 от 01.11.2025\n\n"
-        "После ввода я попрошу вас подтвердить данные и перейти к загрузке выписки ЕГРН.",
+        "🔧 Подготовка запросов ТУ\n\n"
+        "Выберите способ ввода данных:",
+        reply_markup=_input_method_keyboard().as_markup(),
     )
 
 
-# -------------------------- ШАГ 1: ВХОДЯЩИЙ -------------------------- #
-@tu_router.message(TUStates.WAIT_INCOMING, F.text)
-async def tu_got_incoming(m: Message, state: FSMContext):
-    """
-    Пользователь вводит входящий номер и дату в свободной форме.
-    Мы сохраняем строку как есть.
-    """
-    incoming_raw = (m.text or "").strip()
-    if not incoming_raw:
-        await m.answer(
-            "Не удалось распознать текст входящего.\n"
-            "Пожалуйста, введите строку в формате, например:\n"
-            "124245 от 01.11.2025"
-        )
-        return
+# ==================== ВЕТКА 1: ПРИКРЕПИТЬ ЗАЯВЛЕНИЕ ==================== #
 
-    await state.update_data(incoming=incoming_raw)
-
-    await m.answer(
-        f"Приняла:\n{incoming_raw}\n\n"
-        f"Если всё верно, нажмите «Далее».",
-        reply_markup=_next_button().as_markup(),
-    )
-
-
-@tu_router.callback_query(TUStates.WAIT_INCOMING, F.data == "tu:next")
-async def tu_after_incoming(call: CallbackQuery, state: FSMContext):
-    """
-    Пользователь подтвердил входящие данные — переходим к шагу загрузки выписки.
-    """
+@tu_router.callback_query(TUStates.WAIT_INPUT_METHOD, F.data == "tu:attach_app")
+async def tu_chose_attach_app(call: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал прикрепить заявление."""
     await call.answer()
-    await state.set_state(TUStates.WAIT_EGRN)
-
+    await state.set_state(TUStates.WAIT_APPLICATION_DOC)
+    
     await call.message.answer(
-        "Шаг 2. Прикрепите выписку из ЕГРН на земельный участок "
-        "в формате *.xml* или *.zip* (файл выписки).\n\n"
-        "После загрузки файла я покажу данные по участку и предложу варианты подготовки ТУ.",
-        parse_mode="Markdown",
+        "📄 Прикрепите заявление о выдаче ГПЗУ в формате DOCX.\n\n"
+        "Я автоматически извлеку из него:\n"
+        "• Номер заявления\n"
+        "• Дату заявления\n"
+        "• Заявителя\n"
+        "• Кадастровый номер\n\n"
+        "После этого попрошу прикрепить выписку ЕГРН."
     )
 
 
-@tu_router.message(TUStates.WAIT_INCOMING)
-async def tu_waiting_incoming_fallback(m: Message, state: FSMContext):
-    """
-    Любые другие сообщения в состоянии WAIT_INCOMING.
-    """
-    await m.answer(
-        "Сейчас я жду строку с входящим номером и датой, например:\n"
-        "124245 от 01.11.2025"
-    )
-
-
-# -------------------------- ШАГ 2: ВЫПИСКА ЕГРН -------------------------- #
-@tu_router.message(TUStates.WAIT_EGRN, F.document)
-async def tu_got_egrn(m: Message, state: FSMContext):
-    """
-    Принимаем файл выписки (xml или zip), скачиваем, парсим,
-    проверяем, что это ЗУ, показываем данные и предлагаем выбрать режим подготовки ТУ.
-    """
+@tu_router.message(TUStates.WAIT_APPLICATION_DOC, F.document)
+async def tu_got_application(m: Message, state: FSMContext):
+    """Получено заявление - парсим его."""
     doc: TgDocument = m.document
-
-    if not doc.file_name or not (
-        doc.file_name.lower().endswith(".xml")
-        or doc.file_name.lower().endswith(".zip")
-    ):
+    
+    if not doc.file_name or not doc.file_name.lower().endswith(".docx"):
+        await m.answer("❌ Это не DOCX-файл. Пожалуйста, прикрепите заявление в формате DOCX.")
+        return
+    
+    # Скачиваем
+    try:
+        file = await m.bot.get_file(doc.file_id)
+        app_bytes = await download_with_retries(m.bot, file.file_path)
+        logger.info("TU: получено заявление: %s (%d байт)", doc.file_name, len(app_bytes))
+    except Exception as ex:
+        logger.exception("TU: ошибка скачивания заявления: %s", ex)
+        await m.answer(f"❌ Не удалось скачать файл: {ex}")
+        return
+    
+    # Парсим
+    try:
+        app_data: ApplicationData = parse_application_docx(app_bytes)
+    except Exception as ex:
+        logger.exception("TU: ошибка парсинга заявления: %s", ex)
+        await m.answer(f"❌ Не удалось разобрать заявление: {ex}")
+        return
+    
+    # Проверяем, что извлечены основные данные
+    if not app_data.number:
         await m.answer(
-            "Это не XML/ZIP-файл.\n"
-            "Пожалуйста, пришлите выписку из ЕГРН на земельный участок "
-            "в формате *.xml* или *.zip*.",
+            "⚠️ Не удалось извлечь номер заявления из документа.\n"
+            "Проверьте формат файла или используйте ручной ввод."
         )
         return
+    
+    # Сохраняем данные
+    await state.update_data(
+        app_number=app_data.number or "",
+        app_date=app_data.date_text or "",
+        applicant=app_data.applicant or "",
+        cadnum=app_data.cadnum or "",
+    )
+    
+    # Показываем извлечённые данные
+    lines = [
+        "✅ Заявление успешно обработано!",
+        "",
+        f"📋 Номер заявления: {app_data.number or '—'}",
+        f"📅 Дата заявления: {app_data.date_text or '—'}",
+        f"👤 Заявитель: {app_data.applicant or '—'}",
+        f"🏞 Кадастровый номер: {app_data.cadnum or '—'}",
+    ]
+    
+    await m.answer("\n".join(lines))
+    
+    # Переходим к запросу ЕГРН
+    await state.set_state(TUStates.WAIT_EGRN_AFTER_APP)
+    await m.answer(
+        "📎 Теперь прикрепите выписку из ЕГРН на земельный участок "
+        "в формате XML или ZIP.\n\n"
+        "Из выписки я извлеку адрес, площадь и ВРИ."
+    )
 
-    data = await state.get_data()
-    incoming = data.get("incoming") or ""
 
-    # 1. Скачиваем
+@tu_router.message(TUStates.WAIT_APPLICATION_DOC)
+async def tu_waiting_app_fallback(m: Message, state: FSMContext):
+    """Ожидается файл заявления."""
+    await m.answer("📄 Пожалуйста, прикрепите заявление в формате DOCX.")
+
+
+@tu_router.message(TUStates.WAIT_EGRN_AFTER_APP, F.document)
+async def tu_got_egrn_after_app(m: Message, state: FSMContext):
+    """Получена выписка ЕГРН после заявления - завершаем формирование."""
+    doc: TgDocument = m.document
+    
+    if not doc.file_name or not (
+        doc.file_name.lower().endswith(".xml") or doc.file_name.lower().endswith(".zip")
+    ):
+        await m.answer("❌ Это не XML/ZIP-файл. Пожалуйста, прикрепите выписку ЕГРН.")
+        return
+    
+    # Скачиваем
     try:
         file = await m.bot.get_file(doc.file_id)
         egrn_bytes = await download_with_retries(m.bot, file.file_path)
-        logger.info(
-            "TU: получен файл ЕГРН: %s (%d байт), входящий=%s",
-            doc.file_name,
-            len(egrn_bytes),
-            incoming,
-        )
+        logger.info("TU: получена выписка ЕГРН: %s (%d байт)", doc.file_name, len(egrn_bytes))
     except Exception as ex:
         logger.exception("TU: ошибка скачивания ЕГРН: %s", ex)
-        await m.answer(
-            f"Не удалось скачать файл выписки: {ex}\n"
-            "Попробуйте отправить файл ещё раз."
-        )
+        await m.answer(f"❌ Не удалось скачать файл: {ex}")
         return
-
-    # 2. Парсим
+    
+    # Парсим
     try:
         egrn: EGRNData = parse_egrn_xml(egrn_bytes)
     except Exception as ex:
         logger.exception("TU: ошибка парсинга ЕГРН: %s", ex)
-        await m.answer(
-            f"Не удалось разобрать выписку ЕГРН: {ex}\n"
-            "Проверьте, что приложен корректный XML/ZIP-файл."
-        )
+        await m.answer(f"❌ Не удалось разобрать выписку ЕГРН: {ex}")
         return
-
-    # 3. Проверяем тип объекта
+    
+    # Проверяем, что это ЗУ
     if not egrn.is_land:
-        await m.answer(
-            "Это не выписка ЕГРН по земельному участку.\n"
-            "Пожалуйста, прикрепите выписку на земельный участок."
-        )
+        await m.answer("❌ Это не выписка ЕГРН по земельному участку.")
         return
-
-    # 4. Сохраняем EGRN в состояние
-    await state.update_data(egrn=_egrn_to_state(egrn))
-    await state.set_state(TUStates.WAIT_ACTION)
-
-    # 5. Показываем пользователю краткие данные по участку
-    vri = getattr(egrn, "permitted_use", None)
-    area_txt = egrn.area or "—"
-    addr_txt = egrn.address or "—"
-
-    text_lines: List[str] = []
-    text_lines.append("Данные по земельному участку из ЕГРН:")
-    text_lines.append(f"Кадастровый номер: {egrn.cadnum or '—'}")
-    text_lines.append(f"Площадь: {area_txt} кв. м")
-    text_lines.append(f"ВРИ: {vri or '—'}")
-    text_lines.append(f"Адрес: {addr_txt}")
-    text = "\n".join(text_lines)
-
-    await m.answer(
-        text + "\n\nВыберите вариант подготовки запросов ТУ:",
-        reply_markup=_tu_mode_keyboard().as_markup(),
-    )
-
-
-@tu_router.message(TUStates.WAIT_EGRN)
-async def tu_waiting_egrn_fallback(m: Message, state: FSMContext):
-    """
-    Любые другие сообщения в состоянии WAIT_EGRN.
-    """
-    await m.answer(
-        "Сейчас я жду файл выписки ЕГРН (XML или ZIP).\n"
-        "Пожалуйста, прикрепите файл выписки.",
-    )
-
-
-# ---------------------- ВАРИАНТ 1: БЕЗ ИСХОДЯЩЕГО ---------------------- #
-@tu_router.callback_query(TUStates.WAIT_ACTION, F.data == "tu:without_outgoing")
-async def tu_without_outgoing(call: CallbackQuery, state: FSMContext):
-    """
-    Вариант: подготовить ТУ для последующей самостоятельной регистрации.
-    Исходящий номер и дата не заполняются (поля остаются пустыми).
-    """
-    await call.answer()
-
+    
+    # Получаем данные из состояния
     data = await state.get_data()
-    incoming = data.get("incoming") or ""
-    egrn_state = data.get("egrn") or {}
-    egrn = _egrn_from_state(egrn_state)
-
-    await call.message.answer(
-        "Готовлю запросы ТУ для последующей самостоятельной регистрации.\n"
-        "Пожалуйста, подождите...",
-    )
-
+    
+    # Формируем ТУ
+    await m.answer("⚙️ Формирую запросы ТУ с регистрацией...\nПожалуйста, подождите...")
+    
     try:
-        docs: List[Tuple[str, bytes]] = build_tu_docs(egrn, incoming)
-    except Exception as ex:
-        logger.exception("TU: ошибка формирования ТУ без исходящего: %s", ex)
-        await call.message.answer(
-            f"Не удалось сформировать запросы ТУ: {ex}"
+        docs = build_tu_docs_with_outgoing(
+            cadnum=data.get("cadnum") or egrn.cadnum or "",
+            address=egrn.address or "",
+            area=egrn.area or "",
+            vri=egrn.permitted_use or "",
+            app_number=data.get("app_number", ""),
+            app_date=data.get("app_date", ""),
+            applicant=data.get("applicant", ""),
         )
+    except Exception as ex:
+        logger.exception("TU: ошибка формирования ТУ: %s", ex)
+        await m.answer(f"❌ Не удалось сформировать запросы ТУ:\n{ex}")
         await state.clear()
         return
-
-    # Отправляем сформированные DOCX
+    
+    # Отправляем документы
     for filename, file_bytes in docs:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         try:
             tmp.write(file_bytes)
             tmp.flush()
             tmp.close()
-            await call.message.answer_document(
-                FSInputFile(tmp.name, filename=filename)
-            )
+            await m.answer_document(FSInputFile(tmp.name, filename=filename))
         finally:
             try:
                 os.remove(tmp.name)
             except Exception:
                 pass
-
-    await call.message.answer(
-        "Запросы ТУ сформированы.\n"
-        "Можете сохранить файлы и вернуться в главное меню."
+    
+    await m.answer(
+        "✅ Запросы ТУ успешно сформированы и зарегистрированы!\n"
+        "Можете вернуться в главное меню."
     )
     await state.clear()
 
 
-# ---------------------- ВАРИАНТ 2: С ИСХОДЯЩИМ ---------------------- #
-@tu_router.callback_query(TUStates.WAIT_ACTION, F.data == "tu:with_outgoing")
-async def tu_with_outgoing(call: CallbackQuery, state: FSMContext):
-    """
-    Вариант: подготовить ТУ с исходящим номером и датой.
-    Номера и даты берутся/записываются в журнал запросов ТУ (Excel).
-    """
+@tu_router.message(TUStates.WAIT_EGRN_AFTER_APP)
+async def tu_waiting_egrn_after_app_fallback(m: Message, state: FSMContext):
+    """Ожидается выписка ЕГРН."""
+    await m.answer("📎 Пожалуйста, прикрепите выписку ЕГРН (XML или ZIP).")
+
+
+# ==================== ВЕТКА 2: РУЧНОЙ ВВОД ==================== #
+
+@tu_router.callback_query(TUStates.WAIT_INPUT_METHOD, F.data == "tu:manual")
+async def tu_chose_manual(call: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал ручной ввод."""
     await call.answer()
-
-    data = await state.get_data()
-    incoming = data.get("incoming") or ""
-    egrn_state = data.get("egrn") or {}
-    egrn = _egrn_from_state(egrn_state)
-
+    await state.set_state(TUStates.WAIT_MANUAL_APP_NUM)
+    
     await call.message.answer(
-        "Готовлю запросы ТУ с присвоением исходящего номера и даты.\n"
-        "Пожалуйста, подождите...",
+        "⌨️ Ручной ввод данных\n\n"
+        "Шаг 1/5: Введите номер заявления (например, 6422028095):"
     )
 
+
+@tu_router.message(TUStates.WAIT_MANUAL_APP_NUM, F.text)
+async def tu_got_manual_app_num(m: Message, state: FSMContext):
+    """Получен номер заявления."""
+    app_num = (m.text or "").strip()
+    if not app_num:
+        await m.answer("❌ Номер заявления не может быть пустым. Попробуйте ещё раз:")
+        return
+    
+    await state.update_data(app_number=app_num)
+    await state.set_state(TUStates.WAIT_MANUAL_APP_DATE)
+    
+    await m.answer(
+        f"✅ Номер заявления: {app_num}\n\n"
+        "Шаг 2/5: Введите дату заявления (например, 15.11.2025):"
+    )
+
+
+@tu_router.message(TUStates.WAIT_MANUAL_APP_DATE, F.text)
+async def tu_got_manual_app_date(m: Message, state: FSMContext):
+    """Получена дата заявления."""
+    app_date = (m.text or "").strip()
+    if not app_date:
+        await m.answer("❌ Дата заявления не может быть пустой. Попробуйте ещё раз:")
+        return
+    
+    await state.update_data(app_date=app_date)
+    await state.set_state(TUStates.WAIT_MANUAL_APPLICANT)
+    
+    await m.answer(
+        f"✅ Дата заявления: {app_date}\n\n"
+        "Шаг 3/5: Введите заявителя (ФИО или наименование организации):"
+    )
+
+
+@tu_router.message(TUStates.WAIT_MANUAL_APPLICANT, F.text)
+async def tu_got_manual_applicant(m: Message, state: FSMContext):
+    """Получен заявитель."""
+    applicant = (m.text or "").strip()
+    if not applicant:
+        await m.answer("❌ Заявитель не может быть пустым. Попробуйте ещё раз:")
+        return
+    
+    await state.update_data(applicant=applicant)
+    await state.set_state(TUStates.WAIT_MANUAL_CADNUM)
+    
+    await m.answer(
+        f"✅ Заявитель: {applicant}\n\n"
+        "Шаг 4/5: Введите кадастровый номер земельного участка (например, 42:30:000000:1234):"
+    )
+
+
+@tu_router.message(TUStates.WAIT_MANUAL_CADNUM, F.text)
+async def tu_got_manual_cadnum(m: Message, state: FSMContext):
+    """Получен кадастровый номер."""
+    cadnum = (m.text or "").strip()
+    if not cadnum:
+        await m.answer("❌ Кадастровый номер не может быть пустым. Попробуйте ещё раз:")
+        return
+    
+    await state.update_data(cadnum=cadnum)
+    await state.set_state(TUStates.WAIT_MANUAL_EGRN)
+    
+    await m.answer(
+        f"✅ Кадастровый номер: {cadnum}\n\n"
+        "Шаг 5/5: Прикрепите выписку из ЕГРН (XML или ZIP).\n"
+        "Из неё я извлеку адрес, площадь и ВРИ."
+    )
+
+
+@tu_router.message(TUStates.WAIT_MANUAL_EGRN, F.document)
+async def tu_got_manual_egrn(m: Message, state: FSMContext):
+    """Получена выписка ЕГРН при ручном вводе - завершаем формирование."""
+    doc: TgDocument = m.document
+    
+    if not doc.file_name or not (
+        doc.file_name.lower().endswith(".xml") or doc.file_name.lower().endswith(".zip")
+    ):
+        await m.answer("❌ Это не XML/ZIP-файл. Пожалуйста, прикрепите выписку ЕГРН.")
+        return
+    
+    # Скачиваем
     try:
-        docs: List[Tuple[str, bytes]] = build_tu_docs_with_outgoing(egrn, incoming)
+        file = await m.bot.get_file(doc.file_id)
+        egrn_bytes = await download_with_retries(m.bot, file.file_path)
     except Exception as ex:
-        logger.exception("TU: ошибка формирования ТУ с исходящим: %s", ex)
-        await call.message.answer(
-            f"Не удалось сформировать запросы ТУ: {ex}"
+        logger.exception("TU: ошибка скачивания ЕГРН: %s", ex)
+        await m.answer(f"❌ Не удалось скачать файл: {ex}")
+        return
+    
+    # Парсим
+    try:
+        egrn: EGRNData = parse_egrn_xml(egrn_bytes)
+    except Exception as ex:
+        logger.exception("TU: ошибка парсинга ЕГРН: %s", ex)
+        await m.answer(f"❌ Не удалось разобрать выписку ЕГРН: {ex}")
+        return
+    
+    if not egrn.is_land:
+        await m.answer("❌ Это не выписка ЕГРН по земельному участку.")
+        return
+    
+    # Получаем данные
+    data = await state.get_data()
+    
+    # Формируем ТУ
+    await m.answer("⚙️ Формирую запросы ТУ с регистрацией...\nПожалуйста, подождите...")
+    
+    try:
+        docs = build_tu_docs_with_outgoing(
+            cadnum=data.get("cadnum", ""),
+            address=egrn.address or "",
+            area=egrn.area or "",
+            vri=egrn.permitted_use or "",
+            app_number=data.get("app_number", ""),
+            app_date=data.get("app_date", ""),
+            applicant=data.get("applicant", ""),
         )
+    except Exception as ex:
+        logger.exception("TU: ошибка формирования ТУ: %s", ex)
+        await m.answer(f"❌ Не удалось сформировать запросы ТУ:\n{ex}")
         await state.clear()
         return
-
-    # Отправляем сформированные DOCX
+    
+    # Отправляем документы
     for filename, file_bytes in docs:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         try:
             tmp.write(file_bytes)
             tmp.flush()
             tmp.close()
-            await call.message.answer_document(
-                FSInputFile(tmp.name, filename=filename)
-            )
+            await m.answer_document(FSInputFile(tmp.name, filename=filename))
         finally:
             try:
                 os.remove(tmp.name)
             except Exception:
                 pass
-
-    await call.message.answer(
-        "Запросы ТУ сформированы.\n"
-        "Можете сохранить файлы и вернуться в главное меню."
+    
+    await m.answer(
+        "✅ Запросы ТУ успешно сформированы и зарегистрированы!\n"
+        "Можете вернуться в главное меню."
     )
     await state.clear()
 
 
-@tu_router.message(TUStates.WAIT_ACTION)
-async def tu_waiting_action_fallback(m: Message, state: FSMContext):
-    """
-    Если после вывода данных по ЗУ пользователь пишет текст,
-    а не выбирает кнопку.
-    """
-    await m.answer(
-        "Пожалуйста, выберите один из вариантов подготовки ТУ с помощью кнопок ниже.",
-        reply_markup=_tu_mode_keyboard().as_markup(),
-    )
+@tu_router.message(TUStates.WAIT_MANUAL_EGRN)
+async def tu_waiting_manual_egrn_fallback(m: Message, state: FSMContext):
+    """Ожидается выписка ЕГРН."""
+    await m.answer("📎 Пожалуйста, прикрепите выписку ЕГРН (XML или ZIP).")
